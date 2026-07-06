@@ -1,0 +1,22 @@
+.DS_Store
+.DS_Store?
+Thumbs.db
+
+/build
+/build/
+/dist
+/dist/
+
+*.dmg
+*.app
+
+# SwiftPM / caches
+.build/
+Package.resolved
+/.swiftpm
+/.vscode
+/.idea
+
+*.tmp
+*.swp
+*~

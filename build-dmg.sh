@@ -30,9 +30,11 @@ xcrun swiftc \
   -O \
   -parse-as-library \
   -o "${MACOS_DIR}/${APP_NAME}" \
+  "${STATUSBAR_DIR}/StatusBarLogic.swift" \
   "${STATUSBAR_DIR}/CodexLBStatusBar.swift" \
   -framework Cocoa \
-  -framework Foundation
+  -framework Foundation \
+  -framework ServiceManagement
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

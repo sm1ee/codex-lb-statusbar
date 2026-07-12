@@ -1,8 +1,10 @@
 import Cocoa
 import Foundation
+import ServiceManagement
 
 private let defaultBaseURL = "http://127.0.0.1:2455"
 private let appDisplayName = "Codex LB Status"
+private let serverVersionMenuItemIdentifier = NSUserInterfaceItemIdentifier("codexLBServerVersion")
 
 private final class SettingsStore {
     private let defaults = UserDefaults.standard
@@ -84,29 +86,17 @@ private struct AccountSummary: Decodable {
     let windowMinutesMonthly: Int?
     let lastRefreshAt: Date?
     let deactivationReason: String?
-    let additionalQuotas: [AccountAdditionalQuota]
+    let securityWorkAuthorized: Bool?
     let limitWarmupEnabled: Bool?
     let limitWarmup: AccountLimitWarmupStatus?
+    let availableResetCredits: Int?
+    let resetCreditNearestExpiresAt: Date?
 }
 
 private struct AccountUsage: Decodable {
     let primaryRemainingPercent: Double?
     let secondaryRemainingPercent: Double?
     let monthlyRemainingPercent: Double?
-}
-
-private struct AccountAdditionalQuota: Decodable {
-    let limitName: String
-    let displayLabel: String?
-    let routingPolicy: String
-    let primaryWindow: AccountAdditionalWindow?
-    let secondaryWindow: AccountAdditionalWindow?
-}
-
-private struct AccountAdditionalWindow: Decodable {
-    let usedPercent: Double
-    let resetAt: Int?
-    let windowMinutes: Int?
 }
 
 private struct AccountLimitWarmupStatus: Decodable {
@@ -117,10 +107,26 @@ private struct AccountLimitWarmupStatus: Decodable {
     let completedAt: Date?
 }
 
+private struct AccountActionResponse: Decodable {
+    let status: String
+}
+
+private struct AccountRoutingPolicyUpdateResponse: Decodable {
+    let accountId: String
+    let routingPolicy: String
+}
+
+private enum AccountMutation {
+    case pause
+    case reactivate
+    case routingPolicy(String)
+}
+
 private final class CodexLBClient {
     private let settings: SettingsStore
     private let session: URLSession
     private let decoder: JSONDecoder
+    private(set) var serverVersion: String?
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -161,6 +167,23 @@ private final class CodexLBClient {
         return try await request(path: "/api/dashboard-auth/totp/verify", method: "POST", body: payload)
     }
 
+    func pauseAccount(_ accountId: String) async throws {
+        let _: AccountActionResponse = try await request(path: "/api/accounts/\(encodedPathComponent(accountId))/pause", method: "POST")
+    }
+
+    func reactivateAccount(_ accountId: String) async throws {
+        let _: AccountActionResponse = try await request(path: "/api/accounts/\(encodedPathComponent(accountId))/reactivate", method: "POST")
+    }
+
+    func updateRoutingPolicy(accountId: String, routingPolicy: String) async throws {
+        let payload = try JSONSerialization.data(withJSONObject: ["routingPolicy": routingPolicy], options: [])
+        let _: AccountRoutingPolicyUpdateResponse = try await request(
+            path: "/api/accounts/\(encodedPathComponent(accountId))/routing-policy",
+            method: "PUT",
+            body: payload
+        )
+    }
+
     private func request<T: Decodable>(path: String, method: String = "GET", body: Data? = nil) async throws -> T {
         let url = try endpoint(path)
         var request = URLRequest(url: url)
@@ -176,6 +199,7 @@ private final class CodexLBClient {
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw ClientError.transport("Unexpected non-HTTP response")
             }
+            serverVersion = httpResponse.value(forHTTPHeaderField: "X-App-Version")
             if httpResponse.statusCode == 401 {
                 throw ClientError.unauthorized
             }
@@ -202,6 +226,12 @@ private final class CodexLBClient {
         }
         return url
     }
+}
+
+private func encodedPathComponent(_ value: String) -> String {
+    var allowed = CharacterSet.urlPathAllowed
+    allowed.remove(charactersIn: "/?#")
+    return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
 }
 
 private extension JSONDecoder {
@@ -246,6 +276,7 @@ private enum DateFormatters {
 private enum VisualStyle {
     static let menuWidth: CGFloat = 440
     static let contentWidth: CGFloat = 416
+    static let accountCardHeight: CGFloat = 152
     static let cardRadius: CGFloat = 10
     static let cardBackground = NSColor(calibratedWhite: 0.12, alpha: 1)
     static let panelBackground = NSColor(calibratedWhite: 0.04, alpha: 1)
@@ -257,9 +288,12 @@ private enum VisualStyle {
     static let trackDim = NSColor(calibratedWhite: 0.16, alpha: 1)
     static let green = NSColor(calibratedRed: 0.07, green: 0.78, blue: 0.45, alpha: 1)
     static let greenDim = NSColor(calibratedRed: 0.02, green: 0.28, blue: 0.20, alpha: 1)
+    static let amber = NSColor(calibratedRed: 0.96, green: 0.62, blue: 0.04, alpha: 1)
+    static let amberDim = NSColor(calibratedRed: 0.30, green: 0.20, blue: 0.03, alpha: 1)
     static let red = NSColor(calibratedRed: 1.00, green: 0.22, blue: 0.34, alpha: 1)
     static let redDim = NSColor(calibratedRed: 0.36, green: 0.08, blue: 0.11, alpha: 1)
     static let blue = NSColor(calibratedRed: 0.19, green: 0.50, blue: 0.78, alpha: 1)
+    static let blueDim = NSColor(calibratedRed: 0.05, green: 0.22, blue: 0.30, alpha: 1)
 }
 
 private class RoundedPanelView: NSView {
@@ -297,11 +331,14 @@ private final class DotView: NSView {
     }
 }
 
-private final class BadgeView: NSView {
+private final class BadgeView: NSButton {
     enum Tone {
         case neutral
         case active
         case warning
+        case danger
+        case burnFirst
+        case preserve
 
         var background: NSColor {
             switch self {
@@ -310,7 +347,13 @@ private final class BadgeView: NSView {
             case .active:
                 return VisualStyle.greenDim
             case .warning:
+                return VisualStyle.amberDim
+            case .danger:
                 return VisualStyle.redDim
+            case .burnFirst:
+                return VisualStyle.amberDim
+            case .preserve:
+                return VisualStyle.blueDim
             }
         }
 
@@ -321,7 +364,13 @@ private final class BadgeView: NSView {
             case .active:
                 return NSColor(calibratedRed: 0.02, green: 0.45, blue: 0.31, alpha: 1)
             case .warning:
+                return NSColor(calibratedRed: 0.55, green: 0.36, blue: 0.03, alpha: 1)
+            case .danger:
                 return NSColor(calibratedRed: 0.55, green: 0.12, blue: 0.18, alpha: 1)
+            case .burnFirst:
+                return NSColor(calibratedRed: 0.55, green: 0.36, blue: 0.03, alpha: 1)
+            case .preserve:
+                return NSColor(calibratedRed: 0.08, green: 0.42, blue: 0.56, alpha: 1)
             }
         }
 
@@ -332,14 +381,46 @@ private final class BadgeView: NSView {
             case .active:
                 return VisualStyle.green
             case .warning:
+                return VisualStyle.amber
+            case .danger:
                 return VisualStyle.red
+            case .burnFirst:
+                return VisualStyle.amber
+            case .preserve:
+                return NSColor(calibratedRed: 0.20, green: 0.72, blue: 0.92, alpha: 1)
             }
         }
     }
 
-    init(text: String, tone: Tone, dot: Bool = false) {
+    let accountId: String?
+    let currentValue: String?
+    private let tone: Tone
+    private var hoverTrackingArea: NSTrackingArea?
+
+    init(
+        text: String,
+        tone: Tone,
+        dot: Bool = false,
+        symbolName: String? = nil,
+        accountId: String? = nil,
+        currentValue: String? = nil,
+        target: AnyObject? = nil,
+        action: Selector? = nil,
+        enabled: Bool = true,
+        busy: Bool = false
+    ) {
+        self.accountId = accountId
+        self.currentValue = currentValue
+        self.tone = tone
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        isBordered = false
+        title = ""
+        self.target = target
+        self.action = action
+        isEnabled = enabled
+        alphaValue = busy ? 0.55 : 1
+        setAccessibilityLabel(text)
         wantsLayer = true
         layer?.backgroundColor = tone.background.cgColor
         layer?.borderColor = tone.border.cgColor
@@ -353,18 +434,81 @@ private final class BadgeView: NSView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
 
-        if dot {
+        var markerWidth: CGFloat = 0
+        if let symbolName {
+            let image = NSImageView()
+            image.translatesAutoresizingMaskIntoConstraints = false
+            image.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: text)
+            image.contentTintColor = tone.text
+            image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+            NSLayoutConstraint.activate([
+                image.widthAnchor.constraint(equalToConstant: 12),
+                image.heightAnchor.constraint(equalToConstant: 12),
+            ])
+            stack.addArrangedSubview(image)
+            markerWidth = 18
+        } else if dot {
             stack.addArrangedSubview(DotView(color: tone.text, size: 7))
+            markerWidth = 13
         }
         let label = makeLabel(text, size: 12, weight: .medium, color: tone.text)
         stack.addArrangedSubview(label)
+        let leadingPadding: CGFloat = markerWidth > 0 ? 10 : 12
+        let contentWidth = label.intrinsicContentSize.width + leadingPadding + markerWidth + 12
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 26),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: dot ? 10 : 12),
+            widthAnchor.constraint(equalToConstant: ceil(contentWidth)),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingPadding),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard isEnabled else {
+            return
+        }
+        layer?.borderWidth = 1.6
+        layer?.borderColor = tone.text.cgColor
+        layer?.backgroundColor = (tone.background.blended(withFraction: 0.12, of: tone.text) ?? tone.background).cgColor
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        layer?.borderWidth = 1
+        layer?.borderColor = tone.border.cgColor
+        layer?.backgroundColor = tone.background.cgColor
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else {
+            return
+        }
+        alphaValue = 0.68
+        super.mouseDown(with: event)
+        alphaValue = 1
     }
 
     @available(*, unavailable)
@@ -398,7 +542,7 @@ private final class QuotaProgressView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let rect = bounds.insetBy(dx: 0, dy: 0)
         let track = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
-        (percent == nil ? VisualStyle.trackDim : VisualStyle.track).setFill()
+        (percent.map(quotaTrackColor) ?? VisualStyle.trackDim).setFill()
         track.fill()
 
         guard let percent else {
@@ -462,14 +606,30 @@ private final class QuotaMiniView: NSView {
 }
 
 private final class AccountCardView: NSView {
-    init(account: AccountSummary) {
-        super.init(frame: NSRect(x: 0, y: 0, width: VisualStyle.contentWidth, height: 148))
+    init(
+        account: AccountSummary,
+        canWrite: Bool,
+        isRefreshing: Bool,
+        mutation: AccountMutation?,
+        actionTarget: AnyObject,
+        statusAction: Selector,
+        routingAction: Selector
+    ) {
+        super.init(frame: NSRect(x: 0, y: 0, width: VisualStyle.contentWidth, height: VisualStyle.accountCardHeight))
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = VisualStyle.cardBackground.cgColor
         layer?.borderColor = VisualStyle.border.cgColor
         layer?.borderWidth = 0.8
         layer?.cornerRadius = 8
+        let controlsBusy = isRefreshing || mutation != nil
+        let routingIsUpdating: Bool
+        if case .routingPolicy = mutation {
+            routingIsUpdating = true
+        } else {
+            routingIsUpdating = false
+        }
+        let statusIsUpdating = mutation != nil && !routingIsUpdating
 
         let title = makeLabel(accountTitle(account), size: 16, weight: .semibold, color: VisualStyle.textPrimary)
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -481,17 +641,79 @@ private final class AccountCardView: NSView {
         identity.spacing = 1
         identity.translatesAutoresizingMaskIntoConstraints = false
 
-        let routing = BadgeView(text: routingLabel(account.routingPolicy), tone: .neutral)
-        let shield = shieldView()
-        let statusTone: BadgeView.Tone = account.status == "active" ? .active : .warning
-        let status = BadgeView(text: account.status.capitalized, tone: statusTone, dot: account.status == "active")
+        let terminalStatus = account.status == "reauth_required" || account.status == "deactivated"
+        let routingPresentation = routingBadgePresentation(account.routingPolicy)
+        let routingTone: BadgeView.Tone
+        switch routingPresentation.tone {
+        case .neutral:
+            routingTone = .neutral
+        case .burnFirst:
+            routingTone = .burnFirst
+        case .preserve:
+            routingTone = .preserve
+        }
+        let routing = BadgeView(
+            text: routingIsUpdating ? "Updating..." : routingPresentation.label,
+            tone: routingTone,
+            symbolName: routingIsUpdating ? "arrow.triangle.2.circlepath" : routingPresentation.symbolName,
+            accountId: account.accountId,
+            currentValue: account.routingPolicy,
+            target: actionTarget,
+            action: routingAction,
+            enabled: canWrite && !controlsBusy && !terminalStatus,
+            busy: routingIsUpdating
+        )
+        routing.toolTip = canWrite && !terminalStatus ? "Change to \(routingBadgePresentation(nextRoutingPolicy(after: account.routingPolicy)).label)" : nil
+        let statusPresentation = accountStatusPresentation(account.status)
+        let statusTone: BadgeView.Tone
+        switch statusPresentation.tone {
+        case .green:
+            statusTone = .active
+        case .amber:
+            statusTone = .warning
+        case .red:
+            statusTone = .danger
+        }
+        let status = BadgeView(
+            text: statusIsUpdating ? "Updating..." : statusPresentation.label,
+            tone: statusTone,
+            dot: !statusIsUpdating && account.status == "active",
+            symbolName: statusIsUpdating ? "arrow.triangle.2.circlepath" : nil,
+            accountId: account.accountId,
+            currentValue: account.status,
+            target: actionTarget,
+            action: statusAction,
+            enabled: canWrite && !controlsBusy && statusPresentation.canToggle,
+            busy: statusIsUpdating
+        )
+        if canWrite && statusPresentation.canToggle {
+            status.toolTip = account.status == "active" ? "Pause account" : "Reactivate account"
+        }
 
-        let topRow = NSStackView(views: [identity, routing, shield, status])
+        var topViews: [NSView] = [identity, routing]
+        if account.securityWorkAuthorized == true {
+            topViews.append(shieldView())
+        }
+        topViews.append(status)
+        let topRow = NSStackView(views: topViews)
         topRow.orientation = .horizontal
         topRow.alignment = .centerY
+        topRow.distribution = .fill
         topRow.spacing = 8
         topRow.translatesAutoresizingMaskIntoConstraints = false
         addSubview(topRow)
+
+        let resetCreditLabel = compactResetCreditLabel(
+            count: account.availableResetCredits ?? 0,
+            expiresAt: account.resetCreditNearestExpiresAt
+        ).map { makeLabel($0, size: 10, weight: .semibold, color: VisualStyle.blue) }
+        if let resetCreditLabel {
+            addSubview(resetCreditLabel)
+            NSLayoutConstraint.activate([
+                resetCreditLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+                resetCreditLabel.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            ])
+        }
 
         let quotaRow = NSStackView()
         quotaRow.orientation = .horizontal
@@ -522,10 +744,10 @@ private final class AccountCardView: NSView {
 
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: VisualStyle.contentWidth),
-            heightAnchor.constraint(equalToConstant: 148),
+            heightAnchor.constraint(equalToConstant: VisualStyle.accountCardHeight),
             topRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             topRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            topRow.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            topRow.topAnchor.constraint(equalTo: topAnchor, constant: resetCreditLabel == nil ? 14 : 18),
             quotaRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             quotaRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             quotaRow.topAnchor.constraint(equalTo: topRow.bottomAnchor, constant: 18),
@@ -542,8 +764,19 @@ private final class AccountCardView: NSView {
 }
 
 private final class AccountsPanelView: RoundedPanelView {
-    init(accounts: [AccountSummary], isRefreshing: Bool, refreshTarget: AnyObject, refreshAction: Selector) {
-        let cardHeight: CGFloat = 148
+    init(
+        accounts: [AccountSummary],
+        isRefreshing: Bool,
+        lastRefreshedAt: Date?,
+        refreshTarget: AnyObject,
+        refreshAction: Selector,
+        canWrite: Bool,
+        accountMutations: [String: AccountMutation],
+        accountActionTarget: AnyObject,
+        statusAction: Selector,
+        routingAction: Selector
+    ) {
+        let cardHeight = VisualStyle.accountCardHeight
         let gap: CGFloat = 8
         let headerHeight: CGFloat = 32
         let maxCardsVisible: CGFloat = 4
@@ -552,28 +785,43 @@ private final class AccountsPanelView: RoundedPanelView {
         let height = min(contentHeight, maxHeight)
         super.init(width: VisualStyle.menuWidth, height: height)
 
-        let refreshButton = NSButton()
-        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh")
-        refreshButton.imagePosition = .imageOnly
-        refreshButton.isBordered = false
-        refreshButton.bezelStyle = .texturedRounded
-        refreshButton.setButtonType(.momentaryPushIn)
-        refreshButton.target = refreshTarget
-        refreshButton.action = refreshAction
-        refreshButton.translatesAutoresizingMaskIntoConstraints = false
-        refreshButton.contentTintColor = VisualStyle.textSecondary
-        refreshButton.isEnabled = !isRefreshing
-        refreshButton.alphaValue = isRefreshing ? 0.45 : 1
-        NSLayoutConstraint.activate([
-            refreshButton.widthAnchor.constraint(equalToConstant: 22),
-            refreshButton.heightAnchor.constraint(equalToConstant: 22),
-        ])
+        let refreshControl: NSView
+        if isRefreshing {
+            let indicator = NSProgressIndicator()
+            indicator.style = .spinning
+            indicator.controlSize = .small
+            indicator.translatesAutoresizingMaskIntoConstraints = false
+            indicator.startAnimation(nil)
+            NSLayoutConstraint.activate([
+                indicator.widthAnchor.constraint(equalToConstant: 16),
+                indicator.heightAnchor.constraint(equalToConstant: 16),
+            ])
+            refreshControl = indicator
+        } else {
+            let button = NSButton()
+            button.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh")
+            button.imagePosition = .imageOnly
+            button.isBordered = false
+            button.bezelStyle = .texturedRounded
+            button.setButtonType(.momentaryPushIn)
+            button.target = refreshTarget
+            button.action = refreshAction
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.contentTintColor = VisualStyle.textSecondary
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 22),
+                button.heightAnchor.constraint(equalToConstant: 22),
+            ])
+            refreshControl = button
+        }
 
         let title = makeLabel("Accounts", size: 15, weight: .bold, color: VisualStyle.textPrimary)
-        let count = makeLabel("\(accounts.filter { $0.status == "active" }.count) active / \(accounts.count) total", size: 11, color: VisualStyle.textMuted)
+        let accountCount = "\(accounts.filter { $0.status == "active" }.count) active / \(accounts.count) total"
+        let refreshStatus = refreshStatusLabel(isRefreshing: isRefreshing, lastRefreshedAt: lastRefreshedAt)
+        let count = makeLabel([accountCount, refreshStatus].compactMap { $0 }.joined(separator: " | "), size: 11, color: VisualStyle.textMuted)
         count.alignment = .right
 
-        let header = NSStackView(views: [title, refreshButton, NSView.spacer(), count])
+        let header = NSStackView(views: [title, refreshControl, NSView.spacer(), count])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.translatesAutoresizingMaskIntoConstraints = false
@@ -586,7 +834,15 @@ private final class AccountsPanelView: RoundedPanelView {
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         for account in accounts.sorted(by: accountSort) {
-            stack.addArrangedSubview(AccountCardView(account: account))
+            stack.addArrangedSubview(AccountCardView(
+                account: account,
+                canWrite: canWrite,
+                isRefreshing: isRefreshing,
+                mutation: accountMutations[account.accountId],
+                actionTarget: accountActionTarget,
+                statusAction: statusAction,
+                routingAction: routingAction
+            ))
         }
 
         let scrollView = NSScrollView()
@@ -648,6 +904,26 @@ private final class StatusMessageView: RoundedPanelView {
     }
 }
 
+private final class MenuContentContainerView: NSView {
+    init(content: NSView) {
+        super.init(frame: content.frame)
+        replaceContent(with: content)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func replaceContent(with content: NSView) {
+        subviews.forEach { $0.removeFromSuperview() }
+        frame.size = content.frame.size
+        content.frame = bounds
+        content.autoresizingMask = [.width, .height]
+        addSubview(content)
+    }
+}
+
 private extension NSView {
     static func spacer() -> NSView {
         let view = NSView()
@@ -687,7 +963,25 @@ private func shieldView() -> NSView {
 }
 
 private func quotaColor(_ percent: Double) -> NSColor {
-    percent <= 20 ? VisualStyle.red : VisualStyle.green
+    switch quotaTone(for: percent) {
+    case .green:
+        return VisualStyle.green
+    case .amber:
+        return VisualStyle.amber
+    case .red:
+        return VisualStyle.red
+    }
+}
+
+private func quotaTrackColor(_ percent: Double) -> NSColor {
+    switch quotaTone(for: percent) {
+    case .green:
+        return VisualStyle.greenDim
+    case .amber:
+        return VisualStyle.amberDim
+    case .red:
+        return VisualStyle.redDim
+    }
 }
 
 private func accountTitle(_ account: AccountSummary) -> String {
@@ -698,21 +992,11 @@ private func accountTitle(_ account: AccountSummary) -> String {
 }
 
 private func accountSubtitle(_ account: AccountSummary) -> String {
+    if accountTitle(account).localizedCaseInsensitiveCompare(account.email) != .orderedSame {
+        return "\(account.planType.capitalized) | \(account.email)"
+    }
     let accountId = account.accountId.count > 12 ? String(account.accountId.prefix(12)) + "..." : account.accountId
     return "\(account.planType.capitalized) | \(accountId)"
-}
-
-private func routingLabel(_ value: String) -> String {
-    switch value {
-    case "burn_first":
-        return "Burn first"
-    case "preserve":
-        return "Preserve"
-    case "normal":
-        return "Normal"
-    default:
-        return value
-    }
 }
 
 private func accountSort(_ lhs: AccountSummary, _ rhs: AccountSummary) -> Bool {
@@ -751,13 +1035,13 @@ private func warmupAttempt(_ account: AccountSummary) -> String {
         return "No attempts"
     }
     if let completedAt = warmup.completedAt {
-        return "\(warmup.status.capitalized) \(relativeTime(completedAt)) ago"
+        return "\(warmup.status.capitalized) \(elapsedTime(since: completedAt)) ago"
     }
-    return "\(warmup.status.capitalized) \(relativeTime(warmup.attemptedAt)) ago"
+    return "\(warmup.status.capitalized) \(elapsedTime(since: warmup.attemptedAt)) ago"
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = SettingsStore()
     private lazy var client = CodexLBClient(settings: settings)
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -765,11 +1049,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var authSession: AuthSession?
     private var latestError: String?
     private var isRefreshing = false
+    private var isMenuOpen = false
+    private var lastRefreshedAt: Date?
     private var refreshTimer: Timer?
+    private var accountMutations: [String: AccountMutation] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem.button?.title = "CLB ..."
+        statusItem.button?.title = "..."
         rebuildMenu()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -785,67 +1072,78 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTimer?.invalidate()
     }
 
-    private func refresh() async {
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+    }
+
+    private func refresh(menuWasOpen: Bool? = nil) async {
         guard !isRefreshing else {
             return
         }
+        let wasMenuOpen = menuWasOpen ?? isMenuOpen
         isRefreshing = true
-        statusItem.button?.title = "CLB ..."
-        rebuildMenu()
+        statusItem.button?.title = "..."
+        rebuildMenu(updateVisiblePanel: wasMenuOpen)
         defer {
             isRefreshing = false
-            rebuildMenu()
+            rebuildMenu(updateVisiblePanel: isMenuOpen)
         }
 
         do {
             authSession = try await client.getSession()
             overview = try await client.fetchOverview()
+            lastRefreshedAt = Date()
             latestError = nil
             updateStatusTitle()
         } catch ClientError.unauthorized {
             overview = nil
             latestError = "Dashboard login required"
-            statusItem.button?.title = "CLB login"
+            statusItem.button?.title = "Login"
         } catch {
             overview = nil
             latestError = error.localizedDescription
-            statusItem.button?.title = "CLB error"
+            statusItem.button?.title = "Error"
         }
     }
 
     private func updateStatusTitle() {
         guard let overview else {
-            statusItem.button?.title = latestError == nil ? "CLB" : "CLB error"
+            statusItem.button?.title = latestError == nil ? "Status" : "Error"
             return
         }
 
         let activeAccounts = overview.accounts.filter { $0.status == "active" }
-        var parts = ["CLB", "\(activeAccounts.count)/\(overview.accounts.count)"]
-        if let primary = minimumRemaining(activeAccounts, keyPath: \.usage?.primaryRemainingPercent) {
-            parts.append("5h")
-            parts.append(formatPercent(primary))
-        }
-        if let secondary = minimumRemaining(activeAccounts, keyPath: \.usage?.secondaryRemainingPercent) {
-            parts.append("W")
-            parts.append(formatPercent(secondary))
-        }
-        if parts.count == 2, let monthly = minimumRemaining(activeAccounts, keyPath: \.usage?.monthlyRemainingPercent) {
-            parts.append("M")
-            parts.append(formatPercent(monthly))
-        }
-        statusItem.button?.title = parts.joined(separator: " ")
+        statusItem.button?.title = quotaSummaryTitle(
+            primary: averageRemaining(activeAccounts.map { $0.usage?.primaryRemainingPercent }),
+            secondary: averageRemaining(activeAccounts.map { $0.usage?.secondaryRemainingPercent }),
+            monthly: averageRemaining(activeAccounts.map { $0.usage?.monthlyRemainingPercent }),
+            activeCount: activeAccounts.count,
+            totalCount: overview.accounts.count
+        )
     }
 
-    private func rebuildMenu() {
+    private func rebuildMenu(updateVisiblePanel: Bool = false) {
+        let previousMenu = statusItem.menu
         let menu = NSMenu()
+        menu.delegate = self
 
         if let overview {
             if !overview.accounts.isEmpty {
                 menu.addItem(viewItem(AccountsPanelView(
                     accounts: overview.accounts,
                     isRefreshing: isRefreshing,
+                    lastRefreshedAt: lastRefreshedAt,
                     refreshTarget: self,
-                    refreshAction: #selector(refreshNow)
+                    refreshAction: #selector(refreshNow),
+                    canWrite: authSession?.role == "admin",
+                    accountMutations: accountMutations,
+                    accountActionTarget: self,
+                    statusAction: #selector(toggleAccountStatus(_:)),
+                    routingAction: #selector(changeRoutingPolicy(_:))
                 )))
             } else {
                 menu.addItem(viewItem(StatusMessageView(
@@ -871,27 +1169,124 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(actionItem("Open Dashboard", #selector(openDashboard)))
         menu.addItem(actionItem("Set Server URL...", #selector(setServerURL)))
+        menu.addItem(launchAtLoginItem())
         menu.addItem(actionItem("Admin Login...", #selector(loginAdmin)))
         menu.addItem(actionItem("Guest Login...", #selector(loginGuest)))
+        menu.addItem(serverVersionItem())
         menu.addItem(.separator())
         menu.addItem(actionItem("Quit", #selector(quit)))
-        statusItem.menu = menu
+        if updateVisiblePanel,
+           let visibleItem = previousMenu?.items.first,
+           let container = visibleItem.view as? MenuContentContainerView,
+           let updatedView = menu.items.first?.view as? MenuContentContainerView,
+           let updatedContent = updatedView.subviews.first {
+            container.replaceContent(with: updatedContent)
+            previousMenu?.items.first(where: { $0.identifier == serverVersionMenuItemIdentifier })?.title = codexLBVersionLabel(client.serverVersion)
+            previousMenu?.update()
+        } else {
+            statusItem.menu = menu
+        }
     }
 
     private func viewItem(_ view: NSView) -> NSMenuItem {
         let item = NSMenuItem()
-        item.view = view
+        item.view = MenuContentContainerView(content: view)
         return item
     }
 
     @objc private func refreshNow() {
+        let menuWasOpen = isMenuOpen
         Task {
-            await refresh()
+            await refresh(menuWasOpen: menuWasOpen)
         }
+    }
+
+    @objc private func toggleAccountStatus(_ sender: BadgeView) {
+        guard authSession?.role == "admin",
+              let accountId = sender.accountId,
+              let status = sender.currentValue else {
+            return
+        }
+        switch status {
+        case "active":
+            performAccountMutation(accountId: accountId, mutation: .pause)
+        case "paused":
+            performAccountMutation(accountId: accountId, mutation: .reactivate)
+        default:
+            return
+        }
+    }
+
+    @objc private func changeRoutingPolicy(_ sender: BadgeView) {
+        guard authSession?.role == "admin",
+              let accountId = sender.accountId,
+              let currentPolicy = sender.currentValue else {
+            return
+        }
+        performAccountMutation(
+            accountId: accountId,
+            mutation: .routingPolicy(nextRoutingPolicy(after: currentPolicy))
+        )
+    }
+
+    private func performAccountMutation(accountId: String, mutation: AccountMutation) {
+        guard authSession?.role == "admin", accountMutations[accountId] == nil else {
+            return
+        }
+        accountMutations[accountId] = mutation
+        let menuWasOpen = isMenuOpen
+        rebuildMenu(updateVisiblePanel: menuWasOpen)
+
+        Task {
+            do {
+                switch mutation {
+                case .pause:
+                    try await client.pauseAccount(accountId)
+                case .reactivate:
+                    try await client.reactivateAccount(accountId)
+                case .routingPolicy(let routingPolicy):
+                    try await client.updateRoutingPolicy(accountId: accountId, routingPolicy: routingPolicy)
+                }
+                await refreshWhenIdle(menuWasOpen: menuWasOpen)
+            } catch {
+                accountMutations.removeValue(forKey: accountId)
+                rebuildMenu(updateVisiblePanel: isMenuOpen)
+                showError(error.localizedDescription)
+                return
+            }
+            accountMutations.removeValue(forKey: accountId)
+            rebuildMenu(updateVisiblePanel: isMenuOpen)
+        }
+    }
+
+    private func refreshWhenIdle(menuWasOpen: Bool) async {
+        while isRefreshing {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        await refresh(menuWasOpen: menuWasOpen)
     }
 
     @objc private func openDashboard() {
         NSWorkspace.shared.open(settings.baseURL)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            switch service.status {
+            case .enabled:
+                try service.unregister()
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            case .notRegistered, .notFound:
+                try service.register()
+            @unknown default:
+                try service.register()
+            }
+            rebuildMenu()
+        } catch {
+            showError("Could not update Launch at Login: \(error.localizedDescription)")
+        }
     }
 
     @objc private func setServerURL() {
@@ -1001,9 +1396,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
-    private func minimumRemaining(_ accounts: [AccountSummary], keyPath: KeyPath<AccountSummary, Double?>) -> Double? {
-        accounts.compactMap { $0[keyPath: keyPath] }.min()
+    private func launchAtLoginItem() -> NSMenuItem {
+        let item = actionItem("Launch at Login", #selector(toggleLaunchAtLogin))
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            item.state = .on
+        case .requiresApproval:
+            item.state = .mixed
+            item.toolTip = "Approval required in System Settings"
+        case .notRegistered, .notFound:
+            item.state = .off
+        @unknown default:
+            item.state = .off
+        }
+        return item
     }
+
+    private func serverVersionItem() -> NSMenuItem {
+        let item = NSMenuItem(title: codexLBVersionLabel(client.serverVersion), action: nil, keyEquivalent: "")
+        item.identifier = serverVersionMenuItemIdentifier
+        item.isEnabled = false
+        return item
+    }
+
 }
 
 private func formatPercent(_ value: Double) -> String {

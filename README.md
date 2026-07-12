@@ -4,7 +4,7 @@ Current version: **v0.2.0**
 
 Native macOS menu bar app for checking [Codex LB](https://github.com/Soju06/codex-lb) account availability and quota without opening the dashboard.
 
-![Codex LB Status Bar](assets/demo.png)
+![Codex LB Status Bar](assets/statusbar-v0.2.0.png)
 
 ## Features
 

@@ -1372,6 +1372,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             : NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         field.stringValue = defaultValue
         alert.accessoryView = field
+        alert.layout()
+        alert.window.initialFirstResponder = field
 
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else {

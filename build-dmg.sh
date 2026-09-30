@@ -29,11 +29,13 @@ mkdir -p "${MACOS_DIR}" "${DIST_DIR}"
 xcrun swiftc \
   -O \
   -parse-as-library \
+  -target "$(uname -m)-apple-macos13.0" \
   -o "${MACOS_DIR}/${APP_NAME}" \
   "${STATUSBAR_DIR}/StatusBarLogic.swift" \
   "${STATUSBAR_DIR}/CodexLBStatusBar.swift" \
   -framework Cocoa \
   -framework Foundation \
+  -framework Security \
   -framework ServiceManagement \
   -framework UserNotifications
 

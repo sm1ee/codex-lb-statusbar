@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import Security
 import ServiceManagement
 import UserNotifications
 
@@ -7,10 +8,16 @@ private let defaultBaseURL = "http://127.0.0.1:2455"
 private let appDisplayName = "Codex LB Status"
 private let serverVersionMenuItemIdentifier = NSUserInterfaceItemIdentifier("codexLBServerVersion")
 
+private enum SavedLoginRole: String {
+    case admin
+    case guest
+}
+
 private final class SettingsStore {
     private let defaults = UserDefaults.standard
     private let baseURLKey = "codexLBBaseURL"
     private let notificationsKey = "codexLBNotificationsEnabled"
+    private let loginRolesKey = "codexLBLoginRolesByURL"
 
     var baseURLString: String {
         get {
@@ -35,12 +42,72 @@ private final class SettingsStore {
         URL(string: baseURLString) ?? URL(string: defaultBaseURL)!
     }
 
+    func loginRole(for baseURL: String) -> SavedLoginRole {
+        let roles = defaults.dictionary(forKey: loginRolesKey)
+        return SavedLoginRole(rawValue: roles?[baseURL] as? String ?? "") ?? .admin
+    }
+
+    func setLoginRole(_ role: SavedLoginRole, for baseURL: String) {
+        var roles = defaults.dictionary(forKey: loginRolesKey) ?? [:]
+        roles[baseURL] = role.rawValue
+        defaults.set(roles, forKey: loginRolesKey)
+    }
+
     private static func normalizedBaseURL(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return defaultBaseURL
         }
         return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+}
+
+private enum DashboardPasswordStore {
+    private static func query(for role: SavedLoginRole, baseURL: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "local.codex-lb.statusbar.\(role.rawValue)-password",
+            kSecAttrAccount as String: baseURL
+        ]
+    }
+
+    static func read(_ role: SavedLoginRole, for baseURL: String) -> String? {
+        let lookup = query(for: role, baseURL: baseURL).merging([
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]) { _, new in new }
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(lookup as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ password: String, role: SavedLoginRole, for baseURL: String) -> OSStatus {
+        let query = query(for: role, baseURL: baseURL)
+        let attributes: [String: Any] = [kSecValueData as String: Data(password.utf8)]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
+        }
+        return status
+    }
+
+    /// Attribute-only lookup: doesn't read the secret, so it never triggers a Keychain access prompt.
+    static func hasAny(for baseURL: String) -> Bool {
+        [SavedLoginRole.admin, .guest].contains { role in
+            let lookup = query(for: role, baseURL: baseURL).merging([
+                kSecReturnAttributes as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]) { _, new in new }
+            return SecItemCopyMatching(lookup as CFDictionary, nil) == errSecSuccess
+        }
+    }
+
+    static func delete(_ role: SavedLoginRole, for baseURL: String) -> OSStatus {
+        let status = SecItemDelete(query(for: role, baseURL: baseURL) as CFDictionary)
+        return status == errSecItemNotFound ? errSecSuccess : status
     }
 }
 
@@ -1427,6 +1494,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Set while a re-auth instruction alert is modal, so a finished flow can dismiss it.
     private var activeReauthPromptAccountId: String?
     private lazy var notifier = StatusNotifier(settings: settings)
+    /// Saved-credential login is tried once per server until it succeeds, so a stale password
+    /// doesn't hit the server's login rate limiter on every refresh.
+    private var autoLoginAttemptedForURL: String?
+    private var savedLoginError: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1475,7 +1546,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         do {
-            authSession = try await client.getSession()
+            do {
+                authSession = try await client.getSession()
+            } catch ClientError.unauthorized {
+                authSession = nil
+            }
+            if authSession?.authenticated == true {
+                autoLoginAttemptedForURL = nil
+            } else if autoLoginAttemptedForURL != settings.baseURLString {
+                await restoreSavedLogin()
+            }
             let fetched = try await client.fetchOverview()
             overview = fetched
             lastRefreshedAt = Date()
@@ -1486,10 +1566,56 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             overview = nil
             latestError = "Dashboard login required"
             setStatusTitle("Login")
+            if let savedLoginError {
+                latestError = "Dashboard login required (saved login failed: \(savedLoginError))"
+                self.savedLoginError = nil
+            }
         } catch {
             overview = nil
             latestError = error.localizedDescription
             setStatusTitle("Error")
+        }
+    }
+
+    /// Signs in with the last role used for this server (Keychain password, or passwordless guest).
+    /// Failures are swallowed: the overview fetch that follows reports "Dashboard login required".
+    private func restoreSavedLogin() async {
+        let baseURL = settings.baseURLString
+        do {
+            switch settings.loginRole(for: baseURL) {
+            case .admin:
+                guard let password = DashboardPasswordStore.read(.admin, for: baseURL) else {
+                    return
+                }
+                autoLoginAttemptedForURL = baseURL
+                let session = try await client.loginPassword(password)
+                if session.totpRequiredOnLogin {
+                    guard let code = promptText(
+                        title: "TOTP required",
+                        message: "Enter the dashboard TOTP code to restore the saved admin login.",
+                        defaultValue: "",
+                        secure: false
+                    ), !code.isEmpty else {
+                        return
+                    }
+                    authSession = try await client.verifyTotp(code)
+                } else {
+                    authSession = session
+                }
+            case .guest:
+                let password = DashboardPasswordStore.read(.guest, for: baseURL)
+                // Only attempt passwordless guest when the server said it doesn't need a password.
+                guard password != nil || authSession?.guestAccessEnabled == true && authSession?.guestPasswordRequired == false else {
+                    return
+                }
+                autoLoginAttemptedForURL = baseURL
+                authSession = try await client.loginGuest(password: password)
+            }
+            if authSession?.authenticated == true {
+                autoLoginAttemptedForURL = nil
+            }
+        } catch {
+            savedLoginError = error.localizedDescription
         }
     }
 
@@ -1580,7 +1706,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
         } else if let latestError {
             menu.addItem(viewItem(StatusMessageView(
-                title: latestError == "Dashboard login required" ? "Login required" : "Codex LB Connection Error",
+                title: latestError.hasPrefix("Dashboard login required") ? "Login required" : "Codex LB Connection Error",
                 message: latestError,
                 detail: "Server: \(settings.baseURLString)"
             )))
@@ -1599,6 +1725,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(notificationsItem())
         menu.addItem(actionItem("Admin Login...", #selector(loginAdmin)))
         menu.addItem(actionItem("Guest Login...", #selector(loginGuest)))
+        if DashboardPasswordStore.hasAny(for: settings.baseURLString) {
+            menu.addItem(actionItem("Forget Saved Login", #selector(forgetSavedLogin)))
+        }
         menu.addItem(serverVersionItem())
         menu.addItem(.separator())
         menu.addItem(actionItem("Quit", #selector(quit)))
@@ -2095,6 +2224,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         notifier.reset()
         overview = nil
         client = CodexLBClient(settings: settings)
+        autoLoginAttemptedForURL = nil
         Task {
             await refresh()
         }
@@ -2111,6 +2241,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         Task {
             do {
+                let baseURL = settings.baseURLString
                 let session = try await client.loginPassword(password)
                 if session.totpRequiredOnLogin {
                     guard let code = promptText(
@@ -2123,7 +2254,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     }
                     _ = try await client.verifyTotp(code)
                 }
+                let status = DashboardPasswordStore.save(password, role: .admin, for: baseURL)
+                settings.setLoginRole(.admin, for: baseURL)
                 await refresh()
+                if status != errSecSuccess {
+                    showError("Admin login succeeded, but the password could not be saved in Keychain (error \(status)).")
+                }
             } catch {
                 showError(error.localizedDescription)
             }
@@ -2141,11 +2277,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         Task {
             do {
+                let baseURL = settings.baseURLString
                 _ = try await client.loginGuest(password: password.isEmpty ? nil : password)
+                let status = password.isEmpty
+                    ? DashboardPasswordStore.delete(.guest, for: baseURL)
+                    : DashboardPasswordStore.save(password, role: .guest, for: baseURL)
+                settings.setLoginRole(.guest, for: baseURL)
                 await refresh()
+                if status != errSecSuccess {
+                    showError("Guest login succeeded, but its Keychain entry could not be updated (error \(status)).")
+                }
             } catch {
                 showError(error.localizedDescription)
             }
+        }
+    }
+
+    @objc private func forgetSavedLogin() {
+        let baseURL = settings.baseURLString
+        let statuses = [DashboardPasswordStore.delete(.admin, for: baseURL), DashboardPasswordStore.delete(.guest, for: baseURL)]
+        rebuildMenu()
+        if let failure = statuses.first(where: { $0 != errSecSuccess }) {
+            showError("Could not remove the saved login from Keychain (error \(failure)).")
+        } else {
+            showInfo(title: "Saved login removed", message: "Passwords for \(baseURL) were removed from Keychain. The current session stays signed in until it expires.")
         }
     }
 

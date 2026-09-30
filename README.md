@@ -57,6 +57,7 @@ swiftc StatusBarLogic.swift StatusBarLogicTests.swift -o /tmp/statusbar-logic-te
 - The server URL and notification preference are stored in `UserDefaults` for the current macOS user.
 - Quota notifications fire once per threshold crossing and re-arm after the average recovers 5 points above it; nothing is sent for the state seen at launch.
 - Browser re-authentication relies on the Codex LB server's `localhost:1455` OAuth callback. When the server runs on another machine, paste the final callback URL into the app or use device code.
+- After a successful admin or password-protected guest login, the password is stored in macOS Keychain for that server URL. The last selected login role is restored when the session expires; passwordless guest access is remembered without storing a password. TOTP still requires a code when enabled.
 - `Launch at Login` uses the native macOS login-item service.
 - Error and empty states are shown in English.
 

@@ -34,7 +34,8 @@ xcrun swiftc \
   "${STATUSBAR_DIR}/CodexLBStatusBar.swift" \
   -framework Cocoa \
   -framework Foundation \
-  -framework ServiceManagement
+  -framework ServiceManagement \
+  -framework UserNotifications
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

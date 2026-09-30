@@ -1,6 +1,7 @@
 import Cocoa
 import Foundation
 import ServiceManagement
+import UserNotifications
 
 private let defaultBaseURL = "http://127.0.0.1:2455"
 private let appDisplayName = "Codex LB Status"
@@ -9,6 +10,7 @@ private let serverVersionMenuItemIdentifier = NSUserInterfaceItemIdentifier("cod
 private final class SettingsStore {
     private let defaults = UserDefaults.standard
     private let baseURLKey = "codexLBBaseURL"
+    private let notificationsKey = "codexLBNotificationsEnabled"
 
     var baseURLString: String {
         get {
@@ -16,6 +18,16 @@ private final class SettingsStore {
         }
         set {
             defaults.set(Self.normalizedBaseURL(newValue), forKey: baseURLKey)
+        }
+    }
+
+    /// Defaults to on; stored explicitly once the user toggles it.
+    var notificationsEnabled: Bool {
+        get {
+            defaults.object(forKey: notificationsKey) as? Bool ?? true
+        }
+        set {
+            defaults.set(newValue, forKey: notificationsKey)
         }
     }
 
@@ -116,10 +128,56 @@ private struct AccountRoutingPolicyUpdateResponse: Decodable {
     let routingPolicy: String
 }
 
+private struct ResetCreditItem: Decodable {
+    let id: String
+    let status: String?
+    let expiresAt: Date?
+}
+
+private struct ResetCreditsSnapshot: Decodable {
+    let availableCount: Int
+    let nearestExpiresAt: Date?
+    let credits: [ResetCreditItem]
+}
+
+private struct ResetCreditConsumeResponse: Decodable {
+    let code: String?
+    let windowsReset: Int?
+    let redeemedAt: Date?
+}
+
+private struct OAuthStartResponse: Decodable {
+    let flowId: String?
+    let method: String
+    let authorizationUrl: String?
+    let callbackUrl: String?
+    let verificationUrl: String?
+    let userCode: String?
+    let deviceAuthId: String?
+    let intervalSeconds: Int?
+    let expiresInSeconds: Int?
+}
+
+private struct OAuthStatusResponse: Decodable {
+    let status: String
+    let errorMessage: String?
+}
+
+private struct OAuthCompleteResponse: Decodable {
+    let status: String
+}
+
+private struct OAuthManualCallbackResponse: Decodable {
+    let status: String
+    let errorMessage: String?
+}
+
 private enum AccountMutation {
     case pause
     case reactivate
     case routingPolicy(String)
+    case resetCredit
+    case reauth
 }
 
 private final class CodexLBClient {
@@ -184,6 +242,52 @@ private final class CodexLBClient {
         )
     }
 
+    /// Returns `nil` when the server has no cached reset-credit snapshot for the account yet.
+    func getResetCredits(_ accountId: String) async throws -> ResetCreditsSnapshot? {
+        try await request(path: "/api/accounts/\(encodedPathComponent(accountId))/rate-limit-reset-credits")
+    }
+
+    /// `redeemRequestId` makes the consume idempotent: retrying with the same id reuses the server-side pin.
+    func consumeResetCredit(_ accountId: String, redeemRequestId: String) async throws -> ResetCreditConsumeResponse {
+        let payload = try JSONSerialization.data(withJSONObject: ["redeemRequestId": redeemRequestId], options: [])
+        return try await request(
+            path: "/api/accounts/\(encodedPathComponent(accountId))/rate-limit-reset-credits/consume",
+            method: "POST",
+            body: payload
+        )
+    }
+
+    /// Starts a targeted re-authentication flow for an existing account. `method` is "browser" or "device".
+    func startOAuth(method: String, accountId: String) async throws -> OAuthStartResponse {
+        let payload = try JSONSerialization.data(withJSONObject: ["forceMethod": method, "accountId": accountId], options: [])
+        return try await request(path: "/api/oauth/start", method: "POST", body: payload)
+    }
+
+    func oauthStatus(flowId: String?) async throws -> OAuthStatusResponse {
+        var path = "/api/oauth/status"
+        if let flowId, let encoded = flowId.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) {
+            path += "?flowId=\(encoded)"
+        }
+        return try await request(path: path)
+    }
+
+    @discardableResult
+    func completeOAuth(flowId: String?, deviceAuthId: String?, userCode: String?) async throws -> OAuthCompleteResponse {
+        var body: [String: String] = [:]
+        body["flowId"] = flowId
+        body["deviceAuthId"] = deviceAuthId
+        body["userCode"] = userCode
+        let payload = try JSONSerialization.data(withJSONObject: body, options: [])
+        return try await request(path: "/api/oauth/complete", method: "POST", body: payload)
+    }
+
+    func submitOAuthCallback(_ callbackURL: String, flowId: String?) async throws -> OAuthManualCallbackResponse {
+        var body: [String: String] = ["callbackUrl": callbackURL]
+        body["flowId"] = flowId
+        let payload = try JSONSerialization.data(withJSONObject: body, options: [])
+        return try await request(path: "/api/oauth/manual-callback", method: "POST", body: payload)
+    }
+
     private func request<T: Decodable>(path: String, method: String = "GET", body: Data? = nil) async throws -> T {
         let url = try endpoint(path)
         var request = URLRequest(url: url)
@@ -206,7 +310,7 @@ private final class CodexLBClient {
             guard (200..<300).contains(httpResponse.statusCode) else {
                 throw ClientError.server(
                     statusCode: httpResponse.statusCode,
-                    body: String(data: data, encoding: .utf8) ?? ""
+                    body: dashboardErrorMessage(from: data) ?? String(data: data.prefix(300), encoding: .utf8) ?? ""
                 )
             }
             return try decoder.decode(T.self, from: data)
@@ -226,6 +330,14 @@ private final class CodexLBClient {
         }
         return url
     }
+}
+
+private extension CharacterSet {
+    static let urlQueryValueAllowed: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+#?")
+        return allowed
+    }()
 }
 
 private func encodedPathComponent(_ value: String) -> String {
@@ -262,6 +374,13 @@ private enum DateFormatters {
     static let iso8601Fractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static let dateTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
 
@@ -517,6 +636,44 @@ private final class BadgeView: NSButton {
     }
 }
 
+/// Compact text button used for the reset-credit indicator in the card's top-right corner.
+private final class ResetCreditButton: NSButton {
+    let accountId: String
+
+    init(text: String, accountId: String, target: AnyObject, action: Selector, enabled: Bool, busy: Bool) {
+        self.accountId = accountId
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        isBordered = false
+        setButtonType(.momentaryChange)
+        self.target = target
+        self.action = action
+        isEnabled = enabled
+        alphaValue = busy ? 0.55 : 1
+        let symbol = NSImage(systemSymbolName: "arrow.counterclockwise.circle.fill", accessibilityDescription: nil)
+        image = symbol?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+        imagePosition = enabled ? .imageLeading : .noImage
+        contentTintColor = VisualStyle.blue
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: VisualStyle.blue,
+        ])
+        setAccessibilityLabel(text)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
 private final class QuotaProgressView: NSView {
     private let percent: Double?
 
@@ -613,7 +770,8 @@ private final class AccountCardView: NSView {
         mutation: AccountMutation?,
         actionTarget: AnyObject,
         statusAction: Selector,
-        routingAction: Selector
+        routingAction: Selector,
+        resetAction: Selector
     ) {
         super.init(frame: NSRect(x: 0, y: 0, width: VisualStyle.contentWidth, height: VisualStyle.accountCardHeight))
         translatesAutoresizingMaskIntoConstraints = false
@@ -623,13 +781,22 @@ private final class AccountCardView: NSView {
         layer?.borderWidth = 0.8
         layer?.cornerRadius = 8
         let controlsBusy = isRefreshing || mutation != nil
-        let routingIsUpdating: Bool
-        if case .routingPolicy = mutation {
+        var routingIsUpdating = false
+        var statusIsUpdating = false
+        var resetIsUpdating = false
+        var reauthPending = false
+        switch mutation {
+        case .routingPolicy:
             routingIsUpdating = true
-        } else {
-            routingIsUpdating = false
+        case .pause, .reactivate:
+            statusIsUpdating = true
+        case .resetCredit:
+            resetIsUpdating = true
+        case .reauth:
+            reauthPending = true
+        case nil:
+            break
         }
-        let statusIsUpdating = mutation != nil && !routingIsUpdating
 
         let title = makeLabel(accountTitle(account), size: 16, weight: .semibold, color: VisualStyle.textPrimary)
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -641,7 +808,7 @@ private final class AccountCardView: NSView {
         identity.spacing = 1
         identity.translatesAutoresizingMaskIntoConstraints = false
 
-        let terminalStatus = account.status == "reauth_required" || account.status == "deactivated"
+        let terminalStatus = accountNeedsReauthentication(account.status)
         let routingPresentation = routingBadgePresentation(account.routingPolicy)
         let routingTone: BadgeView.Tone
         switch routingPresentation.tone {
@@ -674,19 +841,25 @@ private final class AccountCardView: NSView {
         case .red:
             statusTone = .danger
         }
+        let statusBusy = statusIsUpdating || reauthPending
         let status = BadgeView(
-            text: statusIsUpdating ? "Updating..." : statusPresentation.label,
-            tone: statusTone,
-            dot: !statusIsUpdating && account.status == "active",
-            symbolName: statusIsUpdating ? "arrow.triangle.2.circlepath" : nil,
+            text: statusIsUpdating ? "Updating..." : reauthPending ? "Signing in..." : statusPresentation.label,
+            tone: reauthPending ? .warning : statusTone,
+            dot: !statusBusy && account.status == "active",
+            symbolName: statusBusy ? "arrow.triangle.2.circlepath" : terminalStatus ? "person.badge.key" : nil,
             accountId: account.accountId,
             currentValue: account.status,
             target: actionTarget,
             action: statusAction,
-            enabled: canWrite && !controlsBusy && statusPresentation.canToggle,
+            // A pending sign-in stays clickable so it can be resumed or cancelled.
+            enabled: canWrite && (reauthPending || (!controlsBusy && (statusPresentation.canToggle || terminalStatus))),
             busy: statusIsUpdating
         )
-        if canWrite && statusPresentation.canToggle {
+        if canWrite && reauthPending {
+            status.toolTip = "Sign-in in progress. Click to resume or cancel."
+        } else if canWrite && terminalStatus {
+            status.toolTip = "Re-authenticate account"
+        } else if canWrite && statusPresentation.canToggle {
             status.toolTip = account.status == "active" ? "Pause account" : "Reactivate account"
         }
 
@@ -703,15 +876,34 @@ private final class AccountCardView: NSView {
         topRow.translatesAutoresizingMaskIntoConstraints = false
         addSubview(topRow)
 
+        let resetCount = account.availableResetCredits ?? 0
         let resetCreditLabel = compactResetCreditLabel(
-            count: account.availableResetCredits ?? 0,
+            count: resetCount,
             expiresAt: account.resetCreditNearestExpiresAt
-        ).map { makeLabel($0, size: 10, weight: .semibold, color: VisualStyle.blue) }
+        ).map { label -> ResetCreditButton in
+            let redeemable = canRedeemResetCredit(status: account.status, availableCount: resetCount)
+            let button = ResetCreditButton(
+                text: resetIsUpdating ? "Resetting..." : label,
+                accountId: account.accountId,
+                target: actionTarget,
+                action: resetAction,
+                enabled: canWrite && !controlsBusy && redeemable,
+                busy: resetIsUpdating
+            )
+            if !canWrite {
+                button.toolTip = "Admin login required to use reset credits"
+            } else if !redeemable {
+                button.toolTip = "Reset credits cannot be used while the account is \(statusPresentation.label.lowercased())"
+            } else {
+                button.toolTip = "Use a reset credit (asks for confirmation)"
+            }
+            return button
+        }
         if let resetCreditLabel {
             addSubview(resetCreditLabel)
             NSLayoutConstraint.activate([
                 resetCreditLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-                resetCreditLabel.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+                resetCreditLabel.topAnchor.constraint(equalTo: topAnchor, constant: 2),
             ])
         }
 
@@ -774,7 +966,8 @@ private final class AccountsPanelView: RoundedPanelView {
         accountMutations: [String: AccountMutation],
         accountActionTarget: AnyObject,
         statusAction: Selector,
-        routingAction: Selector
+        routingAction: Selector,
+        resetAction: Selector
     ) {
         let cardHeight = VisualStyle.accountCardHeight
         let gap: CGFloat = 8
@@ -841,7 +1034,8 @@ private final class AccountsPanelView: RoundedPanelView {
                 mutation: accountMutations[account.accountId],
                 actionTarget: accountActionTarget,
                 statusAction: statusAction,
-                routingAction: routingAction
+                routingAction: routingAction,
+                resetAction: resetAction
             ))
         }
 
@@ -1040,6 +1234,182 @@ private func warmupAttempt(_ account: AccountSummary) -> String {
     return "\(warmup.status.capitalized) \(elapsedTime(since: warmup.attemptedAt)) ago"
 }
 
+/// Aggregate quota across accounts that can serve traffic (see `isCountedForQuota`).
+private struct QuotaSummary {
+    let primary: Double?
+    let secondary: Double?
+    let monthly: Double?
+    let activeCount: Int
+    let countedCount: Int
+    let attentionCount: Int
+
+    init(accounts: [AccountSummary]) {
+        let counted = accounts.filter { isCountedForQuota(status: $0.status) }
+        primary = averageRemaining(counted.map { $0.usage?.primaryRemainingPercent })
+        secondary = averageRemaining(counted.map { $0.usage?.secondaryRemainingPercent })
+        monthly = averageRemaining(counted.map { $0.usage?.monthlyRemainingPercent })
+        activeCount = accounts.filter { $0.status == "active" }.count
+        countedCount = counted.count
+        attentionCount = accounts.filter { accountNeedsReauthentication($0.status) }.count
+    }
+}
+
+/// Posts macOS notifications for aggregate quota threshold crossings and accounts that newly need re-auth.
+@MainActor
+private final class StatusNotifier: NSObject, UNUserNotificationCenterDelegate {
+    private let settings: SettingsStore
+    private var tracker = QuotaAlertTracker()
+    private var previousStatuses: [String: String] = [:]
+    var onActivate: (() -> Void)?
+
+    init(settings: SettingsStore) {
+        self.settings = settings
+    }
+
+    /// UNUserNotificationCenter traps when the binary isn't running from an app bundle.
+    private var center: UNUserNotificationCenter? {
+        Bundle.main.bundleIdentifier == nil ? nil : UNUserNotificationCenter.current()
+    }
+
+    var isEnabled: Bool {
+        settings.notificationsEnabled && center != nil
+    }
+
+    func configure() {
+        center?.delegate = self
+        if settings.notificationsEnabled {
+            Task {
+                _ = await requestAuthorization()
+            }
+        }
+    }
+
+    /// Returns false when notifications are unavailable or denied in System Settings.
+    func setEnabled(_ enabled: Bool) async -> Bool {
+        settings.notificationsEnabled = enabled
+        guard enabled else {
+            return true
+        }
+        return await requestAuthorization()
+    }
+
+    /// Forget baselines (e.g. after switching servers) so the next refresh doesn't alert on stale diffs.
+    func reset() {
+        tracker.reset()
+        previousStatuses = [:]
+    }
+
+    func process(_ accounts: [AccountSummary]) {
+        // State is tracked even while disabled, so enabling later doesn't replay old crossings.
+        let summary = QuotaSummary(accounts: accounts)
+        let windows: [(key: String, label: String, value: Double?)] = [
+            ("5h", "5-hour", summary.primary),
+            ("weekly", "Weekly", summary.secondary),
+            ("monthly", "Monthly", summary.monthly),
+        ]
+        var quotaAlerts: [(label: String, value: Double, threshold: Double)] = []
+        for window in windows {
+            if let threshold = tracker.update(key: window.key, percent: window.value), let value = window.value {
+                quotaAlerts.append((window.label, value, threshold))
+            }
+        }
+
+        let currentStatuses = Dictionary(accounts.map { ($0.accountId, $0.status) }, uniquingKeysWith: { _, last in last })
+        let reauthIds = accountsNeedingNewReauthAlert(previous: previousStatuses, current: currentStatuses)
+        previousStatuses = currentStatuses
+
+        guard isEnabled else {
+            return
+        }
+        for alert in quotaAlerts {
+            post(
+                id: "quota-\(alert.label)",
+                title: "\(alert.label) quota below \(Int(alert.threshold))%",
+                body: "Average remaining is \(Int(round(alert.value)))% across \(summary.countedCount) usable account(s)."
+            )
+        }
+        for accountId in reauthIds {
+            guard let account = accounts.first(where: { $0.accountId == accountId }) else {
+                continue
+            }
+            let label = accountStatusPresentation(account.status).label
+            var body = "\(accountTitle(account)) is \(label.lowercased()). Click the account badge to sign in again."
+            if let reason = account.deactivationReason, !reason.isEmpty {
+                body += " Reason: \(reason)"
+            }
+            post(id: "reauth-\(accountId)", title: "Codex LB account needs attention", body: body)
+        }
+    }
+
+    private func requestAuthorization() async -> Bool {
+        guard let center else {
+            return false
+        }
+        do {
+            return try await center.requestAuthorization(options: [.alert, .sound])
+        } catch {
+            return false
+        }
+    }
+
+    private func post(id: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        // Stable identifiers replace an older undelivered alert of the same kind instead of stacking.
+        center?.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        Task { @MainActor in
+            self.onActivate?()
+        }
+        completionHandler()
+    }
+}
+
+@MainActor
+private final class ReauthFlow {
+    let accountId: String
+    let accountName: String
+    let flowId: String?
+    let method: String
+    let authorizationURL: URL?
+    let verificationURL: URL?
+    let userCode: String?
+    let deviceAuthId: String?
+    let intervalSeconds: Int
+    let expiresAt: Date
+    var pollTask: Task<Void, Never>?
+
+    init(accountId: String, accountName: String, response: OAuthStartResponse) {
+        self.accountId = accountId
+        self.accountName = accountName
+        flowId = response.flowId
+        method = response.method == "device" ? "device" : "browser"
+        authorizationURL = response.authorizationUrl.flatMap(URL.init(string:))
+        verificationURL = response.verificationUrl.flatMap(URL.init(string:))
+        userCode = response.userCode
+        deviceAuthId = response.deviceAuthId
+        intervalSeconds = max(1, response.intervalSeconds ?? 2)
+        // Browser flows expire server-side after 15 minutes.
+        expiresAt = Date().addingTimeInterval(TimeInterval(response.expiresInSeconds ?? 15 * 60))
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = SettingsStore()
@@ -1053,10 +1423,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastRefreshedAt: Date?
     private var refreshTimer: Timer?
     private var accountMutations: [String: AccountMutation] = [:]
+    private var reauthFlows: [String: ReauthFlow] = [:]
+    /// Set while a re-auth instruction alert is modal, so a finished flow can dismiss it.
+    private var activeReauthPromptAccountId: String?
+    private lazy var notifier = StatusNotifier(settings: settings)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem.button?.title = "..."
+        setStatusTitle("...")
+        notifier.onActivate = { [weak self] in
+            self?.statusItem.button?.performClick(nil)
+        }
+        notifier.configure()
         rebuildMenu()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -1086,7 +1464,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         let wasMenuOpen = menuWasOpen ?? isMenuOpen
         isRefreshing = true
-        statusItem.button?.title = "..."
+        // Keep the last known quota visible during a refresh instead of flashing "...".
+        if overview == nil {
+            setStatusTitle("...")
+        }
         rebuildMenu(updateVisiblePanel: wasMenuOpen)
         defer {
             isRefreshing = false
@@ -1095,35 +1476,79 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         do {
             authSession = try await client.getSession()
-            overview = try await client.fetchOverview()
+            let fetched = try await client.fetchOverview()
+            overview = fetched
             lastRefreshedAt = Date()
             latestError = nil
             updateStatusTitle()
+            notifier.process(fetched.accounts)
         } catch ClientError.unauthorized {
             overview = nil
             latestError = "Dashboard login required"
-            statusItem.button?.title = "Login"
+            setStatusTitle("Login")
         } catch {
             overview = nil
             latestError = error.localizedDescription
-            statusItem.button?.title = "Error"
+            setStatusTitle("Error")
         }
+    }
+
+    private func setStatusTitle(_ text: String) {
+        statusItem.button?.attributedTitle = NSAttributedString(string: text, attributes: [.font: NSFont.menuBarFont(ofSize: 0)])
+        statusItem.button?.toolTip = nil
     }
 
     private func updateStatusTitle() {
         guard let overview else {
-            statusItem.button?.title = latestError == nil ? "Status" : "Error"
+            setStatusTitle(latestError == nil ? "Status" : "Error")
             return
         }
 
-        let activeAccounts = overview.accounts.filter { $0.status == "active" }
-        statusItem.button?.title = quotaSummaryTitle(
-            primary: averageRemaining(activeAccounts.map { $0.usage?.primaryRemainingPercent }),
-            secondary: averageRemaining(activeAccounts.map { $0.usage?.secondaryRemainingPercent }),
-            monthly: averageRemaining(activeAccounts.map { $0.usage?.monthlyRemainingPercent }),
-            activeCount: activeAccounts.count,
-            totalCount: overview.accounts.count
+        let summary = QuotaSummary(accounts: overview.accounts)
+        let segments = statusTitleSegments(
+            primary: summary.primary,
+            secondary: summary.secondary,
+            monthly: summary.monthly,
+            activeCount: summary.activeCount,
+            totalCount: overview.accounts.count,
+            attentionCount: summary.attentionCount
         )
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        let title = NSMutableAttributedString()
+        for (index, segment) in segments.enumerated() {
+            if index > 0 {
+                title.append(NSAttributedString(string: " ", attributes: [.font: font]))
+            }
+            var attributes: [NSAttributedString.Key: Any] = [.font: font]
+            switch segment.kind {
+            case .attention:
+                attributes[.foregroundColor] = NSColor.systemRed
+                attributes[.font] = NSFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .heavy)
+            case .quota(let tone):
+                attributes[.foregroundColor] = menuBarColor(tone)
+            case .count:
+                break  // default menu bar text color (adapts to light/dark and highlight)
+            }
+            title.append(NSAttributedString(string: segment.text, attributes: attributes))
+        }
+        statusItem.button?.attributedTitle = title
+
+        var tooltip = ["Average remaining across \(summary.countedCount) usable account(s); paused and re-auth accounts are excluded."]
+        if summary.attentionCount > 0 {
+            tooltip.append("\(summary.attentionCount) account(s) need re-authentication.")
+        }
+        statusItem.button?.toolTip = tooltip.joined(separator: "\n")
+    }
+
+    private func menuBarColor(_ tone: QuotaTone) -> NSColor {
+        switch tone {
+        case .green:
+            return .systemGreen
+        case .amber:
+            return .systemOrange
+        case .red:
+            return .systemRed
+        }
     }
 
     private func rebuildMenu(updateVisiblePanel: Bool = false) {
@@ -1143,7 +1568,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     accountMutations: accountMutations,
                     accountActionTarget: self,
                     statusAction: #selector(toggleAccountStatus(_:)),
-                    routingAction: #selector(changeRoutingPolicy(_:))
+                    routingAction: #selector(changeRoutingPolicy(_:)),
+                    resetAction: #selector(resetCreditTapped(_:))
                 )))
             } else {
                 menu.addItem(viewItem(StatusMessageView(
@@ -1170,6 +1596,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(actionItem("Open Dashboard", #selector(openDashboard)))
         menu.addItem(actionItem("Set Server URL...", #selector(setServerURL)))
         menu.addItem(launchAtLoginItem())
+        menu.addItem(notificationsItem())
         menu.addItem(actionItem("Admin Login...", #selector(loginAdmin)))
         menu.addItem(actionItem("Guest Login...", #selector(loginGuest)))
         menu.addItem(serverVersionItem())
@@ -1205,6 +1632,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard authSession?.role == "admin",
               let accountId = sender.accountId,
               let status = sender.currentValue else {
+            return
+        }
+        if reauthFlows[accountId] != nil || accountNeedsReauthentication(status) {
+            afterMenuCloses { [weak self] in
+                self?.presentRecoveryOptions(accountId: accountId)
+            }
             return
         }
         switch status {
@@ -1246,6 +1679,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     try await client.reactivateAccount(accountId)
                 case .routingPolicy(let routingPolicy):
                     try await client.updateRoutingPolicy(accountId: accountId, routingPolicy: routingPolicy)
+                case .resetCredit, .reauth:
+                    // Handled by their dedicated flows (confirmation / OAuth polling).
+                    break
                 }
                 await refreshWhenIdle(menuWasOpen: menuWasOpen)
             } catch {
@@ -1264,6 +1700,362 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         await refresh(menuWasOpen: menuWasOpen)
+    }
+
+    // MARK: - Reset credits
+
+    @objc private func resetCreditTapped(_ sender: ResetCreditButton) {
+        let accountId = sender.accountId
+        guard authSession?.role == "admin", accountMutations[accountId] == nil else {
+            return
+        }
+        afterMenuCloses { [weak self] in
+            self?.confirmAndRedeemResetCredit(accountId: accountId)
+        }
+    }
+
+    private func confirmAndRedeemResetCredit(accountId: String) {
+        guard let account = account(withId: accountId) else {
+            return
+        }
+        Task {
+            // Fresh snapshot: the confirmation must show the credit that will actually be consumed.
+            let snapshot: ResetCreditsSnapshot?
+            do {
+                snapshot = try await client.getResetCredits(accountId)
+            } catch {
+                showError("Could not load reset credits: \(error.localizedDescription)")
+                return
+            }
+            guard let snapshot, snapshot.availableCount > 0 else {
+                showError(snapshot == nil
+                    ? "Reset credit details are not loaded on the server yet. Try again after the next refresh."
+                    : "No reset credits are available for \(accountTitle(account)).")
+                await refresh()
+                return
+            }
+            let expiries = snapshot.credits
+                .filter { $0.status == "available" }
+                .map { $0.expiresAt ?? .distantFuture }
+                .sorted()
+            let soonest = expiries.first.flatMap { $0 == .distantFuture ? nil : $0 }
+            let others = expiries.dropFirst().filter { $0 != .distantFuture }
+            let message = resetCreditConfirmationText(
+                accountName: accountTitle(account),
+                availableCount: snapshot.availableCount,
+                soonestExpiresAt: soonest,
+                otherExpiries: Array(others),
+                formatDate: { DateFormatters.dateTime.string(from: $0) }
+            )
+            guard confirmDestructive(
+                title: "Use a reset credit?",
+                message: message,
+                confirmTitle: "Use Reset Credit"
+            ) else {
+                return
+            }
+            await redeemResetCredit(account: account, redeemRequestId: UUID().uuidString)
+        }
+    }
+
+    private func redeemResetCredit(account: AccountSummary, redeemRequestId: String) async {
+        let accountId = account.accountId
+        guard accountMutations[accountId] == nil else {
+            return
+        }
+        accountMutations[accountId] = .resetCredit
+        rebuildMenu(updateVisiblePanel: isMenuOpen)
+        do {
+            let result = try await client.consumeResetCredit(accountId, redeemRequestId: redeemRequestId)
+            accountMutations.removeValue(forKey: accountId)
+            await refreshWhenIdle(menuWasOpen: isMenuOpen)
+            showInfo(title: "Reset credit used", message: "\(accountTitle(account)): \(resetCreditResultText(windowsReset: result.windowsReset))")
+        } catch {
+            accountMutations.removeValue(forKey: accountId)
+            rebuildMenu(updateVisiblePanel: isMenuOpen)
+            // Retrying with the same redeemRequestId is idempotent on the server, so a lost
+            // response cannot burn a second credit.
+            if confirmRetry(title: "Reset credit failed", message: error.localizedDescription) {
+                await redeemResetCredit(account: account, redeemRequestId: redeemRequestId)
+            } else {
+                await refreshWhenIdle(menuWasOpen: isMenuOpen)
+            }
+        }
+    }
+
+    // MARK: - Re-authentication
+
+    private func presentRecoveryOptions(accountId: String) {
+        if let flow = reauthFlows[accountId] {
+            presentReauthInstructions(flow)
+            return
+        }
+        guard authSession?.role == "admin",
+              accountMutations[accountId] == nil,
+              let account = account(withId: accountId) else {
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Re-authenticate \(accountTitle(account))"
+        var info = "Sign in again with the ChatGPT account \(account.email)."
+        if let reason = account.deactivationReason, !reason.isEmpty {
+            info += "\n\nReason: \(reason)"
+        }
+        info += "\n\nBrowser sign-in needs the Codex LB server to receive the localhost:1455 callback (or you paste the final URL). Device code works from any browser or device."
+        alert.informativeText = info
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Browser Sign-in")
+        alert.addButton(withTitle: "Device Code")
+        let offersReactivate = account.status == "deactivated"
+        if offersReactivate {
+            // The server's reactivate endpoint accepts deactivated (but not reauth_required) accounts.
+            alert.addButton(withTitle: "Reactivate Only")
+        }
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.last?.keyEquivalent = "\u{1b}"
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            startReauth(account: account, method: "browser")
+        case .alertSecondButtonReturn:
+            startReauth(account: account, method: "device")
+        case .alertThirdButtonReturn where offersReactivate:
+            performAccountMutation(accountId: accountId, mutation: .reactivate)
+        default:
+            return
+        }
+    }
+
+    private func startReauth(account: AccountSummary, method: String) {
+        let accountId = account.accountId
+        guard accountMutations[accountId] == nil else {
+            return
+        }
+        accountMutations[accountId] = .reauth
+        rebuildMenu(updateVisiblePanel: isMenuOpen)
+
+        Task {
+            let response: OAuthStartResponse
+            do {
+                response = try await client.startOAuth(method: method, accountId: accountId)
+            } catch {
+                accountMutations.removeValue(forKey: accountId)
+                rebuildMenu(updateVisiblePanel: isMenuOpen)
+                showError("Could not start sign-in: \(error.localizedDescription)")
+                return
+            }
+            let flow = ReauthFlow(accountId: accountId, accountName: accountTitle(account), response: response)
+            // The server falls back to device flow if it cannot bind the browser callback port.
+            if flow.method == "browser", flow.authorizationURL == nil {
+                accountMutations.removeValue(forKey: accountId)
+                rebuildMenu(updateVisiblePanel: isMenuOpen)
+                showError("The server did not return a sign-in URL.")
+                return
+            }
+            reauthFlows[accountId] = flow
+            flow.pollTask = Task { [weak self] in
+                await self?.pollReauth(flow)
+            }
+            if flow.method == "device" {
+                if let userCode = flow.userCode {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(userCode, forType: .string)
+                }
+                // Mirrors the dashboard: acknowledge the device flow right after start.
+                if flow.deviceAuthId != nil, flow.userCode != nil {
+                    _ = try? await client.completeOAuth(flowId: flow.flowId, deviceAuthId: flow.deviceAuthId, userCode: flow.userCode)
+                }
+                if let url = flow.verificationURL {
+                    NSWorkspace.shared.open(url)
+                }
+            } else if let url = flow.authorizationURL {
+                NSWorkspace.shared.open(url)
+            }
+            presentReauthInstructions(flow)
+        }
+    }
+
+    private func presentReauthInstructions(_ flow: ReauthFlow) {
+        guard reauthFlows[flow.accountId] === flow, activeReauthPromptAccountId == nil else {
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        let remaining = compactRemaining(until: flow.expiresAt)
+        var field: NSTextField?
+
+        if flow.method == "device" {
+            let code = flow.userCode ?? "--"
+            alert.messageText = "Enter code \(code)"
+            alert.informativeText = """
+            Open \(flow.verificationURL?.absoluteString ?? "the verification page") and sign in as \(flow.accountName), then enter the code above (already copied to the clipboard).
+
+            This app detects completion automatically. Expires in \(remaining).
+            """
+            alert.addButton(withTitle: "Continue in Background")
+            alert.addButton(withTitle: "Open Page Again")
+            alert.addButton(withTitle: "Copy Code")
+            alert.addButton(withTitle: "Cancel Sign-in")
+        } else {
+            alert.messageText = "Finish signing in to \(flow.accountName)"
+            alert.informativeText = """
+            Complete the ChatGPT sign-in in your browser. This app detects completion automatically.
+
+            If the browser ends on a page that fails to load (localhost:1455, e.g. the server runs on another machine), copy that page's full URL and paste it below. Expires in \(remaining).
+            """
+            let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+            input.placeholderString = "http://localhost:1455/auth/callback?code=..."
+            alert.accessoryView = input
+            field = input
+            alert.addButton(withTitle: "Submit URL")
+            alert.addButton(withTitle: "Continue in Background")
+            alert.addButton(withTitle: "Open Page Again")
+            alert.addButton(withTitle: "Cancel Sign-in")
+        }
+
+        activeReauthPromptAccountId = flow.accountId
+        let response = alert.runModal()
+        activeReauthPromptAccountId = nil
+        // .abort: the flow finished while the alert was open.
+        guard response != .abort, reauthFlows[flow.accountId] === flow else {
+            return
+        }
+
+        let isDevice = flow.method == "device"
+        switch (isDevice, response) {
+        case (true, .alertFirstButtonReturn), (false, .alertSecondButtonReturn):
+            return
+        case (true, .alertSecondButtonReturn), (false, .alertThirdButtonReturn):
+            if let url = isDevice ? flow.verificationURL : flow.authorizationURL {
+                NSWorkspace.shared.open(url)
+            }
+            presentReauthInstructions(flow)
+        case (true, .alertThirdButtonReturn):
+            if let code = flow.userCode {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(code, forType: .string)
+            }
+            presentReauthInstructions(flow)
+        case (false, .alertFirstButtonReturn):
+            let callbackURL = field?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !callbackURL.isEmpty else {
+                presentReauthInstructions(flow)
+                return
+            }
+            submitManualCallback(callbackURL, flow: flow)
+        default:
+            cancelReauth(flow)
+        }
+    }
+
+    private func submitManualCallback(_ callbackURL: String, flow: ReauthFlow) {
+        Task {
+            do {
+                let result = try await client.submitOAuthCallback(callbackURL, flowId: flow.flowId)
+                if result.status == "success" {
+                    await finishReauth(flow, errorMessage: nil)
+                } else {
+                    showError("Sign-in callback was rejected: \(result.errorMessage ?? "unknown error")")
+                    presentReauthInstructions(flow)
+                }
+            } catch {
+                showError("Could not submit the callback URL: \(error.localizedDescription)")
+                presentReauthInstructions(flow)
+            }
+        }
+    }
+
+    private func pollReauth(_ flow: ReauthFlow) async {
+        var consecutiveFailures = 0
+        while !Task.isCancelled, Date() < flow.expiresAt {
+            try? await Task.sleep(nanoseconds: UInt64(flow.intervalSeconds) * 1_000_000_000)
+            guard !Task.isCancelled, reauthFlows[flow.accountId] === flow else {
+                return
+            }
+            do {
+                let status = try await client.oauthStatus(flowId: flow.flowId)
+                consecutiveFailures = 0
+                switch oauthFlowOutcome(status.status) {
+                case .pending:
+                    continue
+                case .success:
+                    // Same as the dashboard: confirm completion for the specific flow.
+                    _ = try? await client.completeOAuth(flowId: flow.flowId, deviceAuthId: flow.deviceAuthId, userCode: flow.userCode)
+                    await finishReauth(flow, errorMessage: nil)
+                    return
+                case .error:
+                    await finishReauth(flow, errorMessage: status.errorMessage ?? "Sign-in failed.")
+                    return
+                }
+            } catch ClientError.unauthorized {
+                await finishReauth(flow, errorMessage: "Dashboard session expired. Log in again and retry.")
+                return
+            } catch {
+                consecutiveFailures += 1
+                if consecutiveFailures >= 5 {
+                    await finishReauth(flow, errorMessage: "Lost contact with the server: \(error.localizedDescription)")
+                    return
+                }
+            }
+        }
+        if !Task.isCancelled {
+            await finishReauth(flow, errorMessage: "Sign-in timed out. Start again from the account badge.")
+        }
+    }
+
+    private func finishReauth(_ flow: ReauthFlow, errorMessage: String?) async {
+        // Both the poller and a manual callback can finish a flow; only the first one wins.
+        guard reauthFlows[flow.accountId] === flow else {
+            return
+        }
+        reauthFlows.removeValue(forKey: flow.accountId)
+        accountMutations.removeValue(forKey: flow.accountId)
+        if activeReauthPromptAccountId == flow.accountId {
+            NSApp.abortModal()
+            // Let the aborted modal session unwind before showing the result alert.
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        await refreshWhenIdle(menuWasOpen: isMenuOpen)
+        if let errorMessage {
+            showError("Re-authentication for \(flow.accountName) failed: \(errorMessage)")
+        } else {
+            showInfo(title: "Re-authenticated", message: "\(flow.accountName) is signed in again.")
+        }
+    }
+
+    private func cancelReauth(_ flow: ReauthFlow) {
+        guard reauthFlows[flow.accountId] === flow else {
+            return
+        }
+        // No server-side cancel endpoint exists; the pending flow expires by TTL.
+        flow.pollTask?.cancel()
+        reauthFlows.removeValue(forKey: flow.accountId)
+        accountMutations.removeValue(forKey: flow.accountId)
+        rebuildMenu(updateVisiblePanel: isMenuOpen)
+    }
+
+    private func cancelAllReauthFlows() {
+        for flow in Array(reauthFlows.values) {
+            cancelReauth(flow)
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func account(withId accountId: String) -> AccountSummary? {
+        overview?.accounts.first { $0.accountId == accountId }
+    }
+
+    /// Runs `work` after the status menu has finished tracking, so modal alerts don't fight the open menu.
+    private func afterMenuCloses(_ work: @escaping @MainActor () -> Void) {
+        statusItem.menu?.cancelTracking()
+        RunLoop.main.perform(inModes: [.default]) {
+            Task { @MainActor in
+                work()
+            }
+        }
     }
 
     @objc private func openDashboard() {
@@ -1299,6 +2091,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
         settings.baseURLString = value
+        cancelAllReauthFlows()
+        notifier.reset()
+        overview = nil
         client = CodexLBClient(settings: settings)
         Task {
             await refresh()
@@ -1390,6 +2185,42 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.runModal()
     }
 
+    private func showInfo(title: String, message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// Confirmation where Return/Escape both choose Cancel, so a stray keypress can't trigger the action.
+    private func confirmDestructive(title: String, message: String, confirmTitle: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        let confirm = alert.addButton(withTitle: confirmTitle)
+        confirm.hasDestructiveAction = true
+        confirm.keyEquivalent = ""
+        let cancel = alert.addButton(withTitle: "Cancel")
+        cancel.keyEquivalent = "\r"
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func confirmRetry(title: String, message: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Retry")
+        alert.addButton(withTitle: "Close")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     private func actionItem(_ title: String, _ selector: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         item.target = self
@@ -1410,6 +2241,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             item.state = .off
         }
         return item
+    }
+
+    private func notificationsItem() -> NSMenuItem {
+        let item = actionItem("Notifications", #selector(toggleNotifications))
+        item.state = settings.notificationsEnabled ? .on : .off
+        item.toolTip = "Alert when average quota drops below \(quotaAlertThresholds.map { "\(Int($0))%" }.joined(separator: " / ")) or an account needs re-authentication"
+        return item
+    }
+
+    @objc private func toggleNotifications() {
+        let enable = !settings.notificationsEnabled
+        Task {
+            let granted = await notifier.setEnabled(enable)
+            rebuildMenu()
+            if enable && !granted {
+                showError("Notifications are blocked. Allow \"Codex LB Status\" in System Settings > Notifications.")
+            }
+        }
     }
 
     private func serverVersionItem() -> NSMenuItem {

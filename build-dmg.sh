@@ -20,11 +20,21 @@ DMG_FILENAME="${APP_NAME}-${APP_VERSION}.dmg"
 APP_DIR="${BUILD_DIR}/${APP_NAME}.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
+RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+ICON_FILE="${STATUSBAR_DIR}/assets/AppIcon.icns"
 DMG_ROOT="${BUILD_DIR}/dmg-root"
 DMG_PATH="${DIST_DIR}/${DMG_FILENAME}"
 
 rm -rf "${BUILD_DIR}" "${DIST_DIR}"
-mkdir -p "${MACOS_DIR}" "${DIST_DIR}"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${DIST_DIR}"
+
+# Regenerate the icon only when missing (assets/make-icon.swift is the source).
+if [[ ! -f "${ICON_FILE}" ]]; then
+  ICONSET_DIR="${BUILD_DIR}/AppIcon.iconset"
+  xcrun swift "${STATUSBAR_DIR}/assets/make-icon.swift" "${ICONSET_DIR}"
+  iconutil -c icns "${ICONSET_DIR}" -o "${ICON_FILE}"
+fi
+cp "${ICON_FILE}" "${RESOURCES_DIR}/AppIcon.icns"
 
 xcrun swiftc \
   -O \
@@ -33,7 +43,10 @@ xcrun swiftc \
   -o "${MACOS_DIR}/${APP_NAME}" \
   "${STATUSBAR_DIR}/StatusBarLogic.swift" \
   "${STATUSBAR_DIR}/CodexLBStatusBar.swift" \
+  "${STATUSBAR_DIR}/AppUpdater.swift" \
+  "${STATUSBAR_DIR}/GlobalHotKey.swift" \
   -framework Cocoa \
+  -framework Carbon \
   -framework Foundation \
   -framework Security \
   -framework ServiceManagement \
@@ -48,6 +61,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>CodexLBStatusBar</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>local.codex-lb.statusbar</string>
   <key>CFBundleInfoDictionaryVersion</key>

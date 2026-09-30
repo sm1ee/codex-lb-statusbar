@@ -4,6 +4,19 @@ import Foundation
 private enum StatusBarLogicTests {
     static func main() {
         aggregationAndAlertTests()
+        displayAndPaceTests()
+        versionTests()
+        accountListTests()
+        assert(sessionMenuLabel(authenticated: false, role: "admin") == nil)
+        assert(sessionMenuLabel(authenticated: true, role: "admin") == "Signed in as Admin")
+        assert(sessionMenuLabel(authenticated: true, role: "guest") == "Signed in as Guest")
+        assert(sessionMenuLabel(authenticated: true, role: nil) == "Signed in")
+        assert(UsageChartStyle(rawValue: "line") == .line)
+        assert(abs(surfaceIntensity(brightness: 0.5) - 1) < 0.0001)
+        assert(abs(surfaceIntensity(brightness: 0) - 0.4) < 0.0001)
+        assert(abs(surfaceIntensity(brightness: 1) - 2.2) < 0.0001)
+        assert(abs(surfaceIntensity(brightness: 7) - 2.2) < 0.0001)
+        assert(surfaceIntensity(brightness: 0.25) < 1 && surfaceIntensity(brightness: 0.75) > 1)
         assert(quotaTone(for: 70) == .green)
         assert(quotaTone(for: 69.9) == .amber)
         assert(quotaTone(for: 30) == .amber)
@@ -167,5 +180,130 @@ private enum StatusBarLogicTests {
             current: ["a": "reauth_required", "b": "reauth_required", "c": "deactivated", "d": "reauth_required"]
         )
         assert(transitions == ["a", "c"])
+
+        assert(statusSegmentTone(.quota(.amber), mode: .full) == .amber)
+        assert(statusSegmentTone(.quota(.green), mode: .full) == .green)
+        assert(statusSegmentTone(.attention, mode: .full) == .red)
+        assert(statusSegmentTone(.count, mode: .full) == nil)
+        assert(statusSegmentTone(.quota(.amber), mode: .warningsOnly) == nil)
+        assert(statusSegmentTone(.quota(.green), mode: .warningsOnly) == nil)
+        assert(statusSegmentTone(.quota(.red), mode: .warningsOnly) == .red)
+        assert(statusSegmentTone(.attention, mode: .warningsOnly) == .red)
+        for kind: StatusTitleSegment.Kind in [.attention, .quota(.red), .quota(.green), .count] {
+            assert(statusSegmentTone(kind, mode: .off) == nil)
+        }
+    }
+
+    static func displayAndPaceTests() {
+        let all = StatusBarItems()
+        func texts(_ items: StatusBarItems, _ style: StatusBarStyle, primary: Double? = 35, secondary: Double? = 8, monthly: Double? = nil, attention: Int = 1) -> [String] {
+            statusTitleSegments(primary: primary, secondary: secondary, monthly: monthly, activeCount: 2, totalCount: 3,
+                                attentionCount: attention, items: items, style: style).map(\.text)
+        }
+        assert(texts(all, .text) == ["!", "5h 35%", "W 8%", "(2/3)"])
+        assert(texts(all, .meter) == ["!", "(2/3)"])
+        assert(texts(all, .meterAndText) == ["!", "5h 35%", "W 8%", "(2/3)"])
+        assert(texts(StatusBarItems(primary: true, secondary: false, accountCount: false), .text) == ["!", "5h 35%"])
+        assert(texts(StatusBarItems(primary: false, secondary: false, accountCount: false), .text, attention: 0) == ["(2/3)"])
+        assert(texts(StatusBarItems(primary: false, secondary: false, accountCount: false), .meter, attention: 0).isEmpty)
+        assert(texts(all, .text, primary: nil, secondary: nil, monthly: 50, attention: 0) == ["M 50%", "(2/3)"])
+
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        // 5h window, 1h elapsed (20%), 10% used -> 10% in reserve, lasts until reset.
+        let reserve = quotaPace(remainingPercent: 90, resetAt: now.addingTimeInterval(4 * 3_600), windowMinutes: 300, now: now)!
+        assert(abs(reserve.expectedRemainingPercent - 80) < 0.001)
+        assert(reserve.paceLabel == "10% in reserve")
+        assert(reserve.runsOutIn == nil && reserve.runwayLabel == "Lasts until reset")
+        // 1h elapsed, 50% used -> runs out in 1h, 30% over pace.
+        let fast = quotaPace(remainingPercent: 50, resetAt: now.addingTimeInterval(4 * 3_600), windowMinutes: 300, now: now)!
+        assert(fast.paceLabel == "30% over pace")
+        assert(fast.runwayLabel == "Runs out in 1h 0m" && fast.isAtRisk)
+        let even = quotaPace(remainingPercent: 79, resetAt: now.addingTimeInterval(4 * 3_600), windowMinutes: 300, now: now)!
+        assert(even.paceLabel == "On pace")
+        let empty = quotaPace(remainingPercent: 0, resetAt: now.addingTimeInterval(3_600), windowMinutes: 300, now: now)!
+        assert(empty.exhausted && empty.paceLabel == "Exhausted" && empty.runwayLabel == "Empty until reset")
+        let unused = quotaPace(remainingPercent: 100, resetAt: now.addingTimeInterval(3_600), windowMinutes: 300, now: now)!
+        assert(unused.runsOutIn == nil && unused.paceLabel == "80% in reserve")
+        assert(quotaPace(remainingPercent: 99, resetAt: now.addingTimeInterval(299 * 60), windowMinutes: 300, now: now) == nil)
+        assert(quotaPace(remainingPercent: 50, resetAt: nil, windowMinutes: 300, now: now) == nil)
+        assert(quotaPace(remainingPercent: 50, resetAt: now.addingTimeInterval(-5), windowMinutes: 300, now: now) == nil)
+
+        assert(relativeUpdatedLabel(now.addingTimeInterval(-20), now: now) == "Updated just now")
+        assert(relativeUpdatedLabel(now.addingTimeInterval(-300), now: now) == "Updated 5m ago")
+        assert(relativeUpdatedLabel(now.addingTimeInterval(-7_200), now: now) == "Updated 2h 0m ago")
+        assert(relativeUpdatedLabel(nil, now: now) == nil)
+
+        assert(resetCreditSummaryText(count: 1, expiresAt: now.addingTimeInterval(28 * 86_400 + 2 * 3_600), now: now)
+            == "1 reset · 28d 2h")
+        assert(resetCreditSummaryText(count: 3, expiresAt: nil, now: now) == "3 resets")
+        assert(resetCreditSummaryText(count: 0, expiresAt: nil, now: now) == nil)
+
+        assert(formatCompactCount(5_900_000_000) == "5.9B")
+        assert(formatCompactCount(85_000_000) == "85M")
+        assert(formatCompactCount(123_456) == "123K")
+        assert(formatCompactCount(1_000) == "1K")
+        assert(formatCompactCount(999) == "999")
+        assert(formatUSD(51.56) == "$51.56")
+        assert(formatUSD(5_251.23) == "$5,251.23")
+        assert(formatUSD(12_345) == "$12.3K")
+    }
+
+    static func versionTests() {
+        assert(isNewerVersion("v0.3.1", than: "0.3.0"))
+        assert(isNewerVersion("0.10.0", than: "0.9.9"))
+        assert(!isNewerVersion("0.3.0", than: "0.3.0"))
+        assert(!isNewerVersion("v0.2.9", than: "0.3.0"))
+        assert(isNewerVersion("1.24.0", than: "1.24.0-beta.3"))
+        assert(isNewerVersion("1.24.0-beta.10", than: "1.24.0-beta.9"))
+        assert(!isNewerVersion("1.24.0-beta.3", than: "1.24.0"))
+        assert(compareVersions("1.2", "1.2.0") == .orderedSame)
+        assert(compareVersions("1.2.0+build5", "1.2.0") == .orderedSame)
+
+        assert(isAppUpdateAsset("CodexLBStatusBar-0.3.1.dmg"))
+        assert(!isAppUpdateAsset("CodexLBStatusBar-0.3.1.zip"))
+        assert(!isAppUpdateAsset("Other-0.3.1.dmg"))
+
+        let hex = String(repeating: "ab", count: 32)
+        assert(sha256FromDigest("sha256:" + hex) == hex)
+        assert(sha256FromDigest("SHA256:" + hex.uppercased()) == hex)
+        assert(sha256FromDigest("sha512:" + hex) == nil)
+        assert(sha256FromDigest("sha256:xyz") == nil)
+        assert(sha256FromDigest(nil) == nil)
+
+        assert(canSelfUpdate(bundlePath: "/Applications/CodexLBStatusBar.app"))
+        assert(!canSelfUpdate(bundlePath: "/Volumes/Codex LB Status v0.3.0/CodexLBStatusBar.app"))
+        assert(!canSelfUpdate(bundlePath: "/private/var/folders/x/AppTranslocation/ABC/d/CodexLBStatusBar.app"))
+        assert(!canSelfUpdate(bundlePath: "/usr/local/bin/CodexLBStatusBar"))
+    }
+
+    static func accountListTests() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        func key(_ id: String, _ status: String, _ p: Double?, _ s: Double?, pr: Double? = nil, sr: Double? = nil) -> AccountSortKey {
+            AccountSortKey(id: id, name: id, status: status, primaryRemaining: p, secondaryRemaining: s,
+                           primaryResetAt: pr.map { now.addingTimeInterval($0) }, secondaryResetAt: sr.map { now.addingTimeInterval($0) })
+        }
+        let keys = [
+            key("b", "active", 80, 20, pr: 3_600, sr: 86_400),   // bottleneck weekly 20, resets in 1d
+            key("a", "active", 90, 95, pr: 7_200, sr: 5 * 86_400),
+            key("c", "rate_limited", 0, 50, pr: 600, sr: 86_400), // bottleneck 5h 0, resets in 10m
+            key("d", "paused", nil, nil),
+        ]
+        assert(orderedAccountIDs(keys, sort: .status, filter: .all) == ["a", "b", "c", "d"])
+        assert(orderedAccountIDs(keys, sort: .remaining, filter: .all) == ["a", "b", "c", "d"])
+        assert(orderedAccountIDs(keys, sort: .resetSoonest, filter: .all) == ["c", "a", "b", "d"])
+        assert(orderedAccountIDs(keys, sort: .name, filter: .all) == ["a", "b", "c", "d"])
+        assert(orderedAccountIDs(keys, sort: .status, filter: .attention) == ["b", "c", "d"])
+        assert(keys[0].bottleneckRemaining == 20)
+        assert(AccountSortOrder.name.next == .status)
+
+        assert(resetCreditExpiresSoon(count: 2, expiresAt: now.addingTimeInterval(3_600), now: now))
+        assert(!resetCreditExpiresSoon(count: 2, expiresAt: now.addingTimeInterval(2 * 86_400), now: now))
+        assert(!resetCreditExpiresSoon(count: 0, expiresAt: now.addingTimeInterval(3_600), now: now))
+        assert(!resetCreditExpiresSoon(count: 1, expiresAt: now.addingTimeInterval(-1), now: now))
+        assert(resetCreditExpiryAlertKey(accountId: "x", expiresAt: now) == "x|2000000")
+
+        assert(staleDataLabel(lastSuccess: nil, now: now) == "Offline")
+        assert(staleDataLabel(lastSuccess: now.addingTimeInterval(-10), now: now) == "Offline · data from just now")
+        assert(staleDataLabel(lastSuccess: now.addingTimeInterval(-300), now: now) == "Offline · data from 5m ago")
     }
 }

@@ -373,3 +373,510 @@ func dashboardErrorMessage(from body: Data) -> String? {
     }
     return nil
 }
+
+// MARK: - Status bar color mode
+
+enum StatusBarColorMode: String, CaseIterable {
+    /// Every quota segment is green/amber/red, plus a red `!`.
+    case full
+    /// Plain text; only the `!` and quota below 30% are red.
+    case warningsOnly
+    /// Plain text everywhere, including the `!`.
+    case off
+
+    var menuTitle: String {
+        switch self {
+        case .full:
+            return "Full Color"
+        case .warningsOnly:
+            return "Warnings Only"
+        case .off:
+            return "Monochrome"
+        }
+    }
+}
+
+/// Color to apply to a status-bar segment, or nil for the default menu-bar text color.
+func statusSegmentTone(_ kind: StatusTitleSegment.Kind, mode: StatusBarColorMode) -> QuotaTone? {
+    switch (mode, kind) {
+    case (.off, _), (_, .count):
+        return nil
+    case (_, .attention):
+        return .red
+    case (.full, .quota(let tone)):
+        return tone
+    case (.warningsOnly, .quota(let tone)):
+        return tone == .red ? .red : nil
+    }
+}
+
+// MARK: - Status bar display options
+
+enum StatusBarStyle: String, CaseIterable {
+    case text
+    case meter
+    case meterAndText
+
+    var title: String {
+        switch self {
+        case .text:
+            return "Text"
+        case .meter:
+            return "Meter"
+        case .meterAndText:
+            return "Meter + Text"
+        }
+    }
+}
+
+struct StatusBarItems: Equatable {
+    var primary = true
+    var secondary = true
+    var accountCount = true
+}
+
+/// Segments to render as text for the chosen style. Meter styles draw the quota bars as an image,
+/// so `.meter` keeps only the `!` and account count as text.
+func statusTitleSegments(
+    primary: Double?,
+    secondary: Double?,
+    monthly: Double?,
+    activeCount: Int,
+    totalCount: Int,
+    attentionCount: Int,
+    items: StatusBarItems,
+    style: StatusBarStyle
+) -> [StatusTitleSegment] {
+    let shownPrimary = items.primary ? primary : nil
+    let shownSecondary = items.secondary ? secondary : nil
+    // Monthly-only plans: fall back to the monthly window when the 5h/weekly windows don't exist.
+    let fallbackMonthly = primary == nil && secondary == nil && (items.primary || items.secondary) ? monthly : nil
+    var segments = statusTitleSegments(
+        primary: shownPrimary,
+        secondary: shownSecondary,
+        monthly: fallbackMonthly,
+        activeCount: activeCount,
+        totalCount: totalCount,
+        attentionCount: attentionCount
+    )
+    if style == .meter {
+        segments.removeAll { if case .quota = $0.kind { return true } else { return false } }
+    }
+    if !items.accountCount {
+        segments.removeAll { $0.kind == .count }
+    }
+    if segments.isEmpty && style == .text {
+        // Never render an empty (invisible, unclickable) status item.
+        segments.append(StatusTitleSegment(text: "(\(activeCount)/\(totalCount))", kind: .count))
+    }
+    return segments
+}
+
+enum UsagePeriod: String, CaseIterable {
+    case day = "1d"
+    case week = "7d"
+    case month = "30d"
+
+    var title: String {
+        switch self {
+        case .day:
+            return "Last 24 hours"
+        case .week:
+            return "Last 7 days"
+        case .month:
+            return "Last 30 days"
+        }
+    }
+}
+
+// MARK: - Pace
+
+struct QuotaPace: Equatable {
+    /// Remaining percent expected at this point if usage were spread evenly across the window.
+    let expectedRemainingPercent: Double
+    /// Positive: used less than the even pace (reserve). Negative: ahead of pace.
+    let deltaPercent: Double
+    /// Seconds until the quota runs out at the average rate so far; nil when it lasts until reset.
+    let runsOutIn: TimeInterval?
+    let exhausted: Bool
+
+    var paceLabel: String {
+        if exhausted {
+            return "Exhausted"
+        }
+        if abs(deltaPercent) < 3 {
+            return "On pace"
+        }
+        let value = Int(round(abs(deltaPercent)))
+        return deltaPercent > 0 ? "\(value)% in reserve" : "\(value)% over pace"
+    }
+
+    var runwayLabel: String {
+        if exhausted {
+            return "Empty until reset"
+        }
+        guard let runsOutIn else {
+            return "Lasts until reset"
+        }
+        return "Runs out in \(compactRemaining(until: Date(timeIntervalSinceReferenceDate: runsOutIn), now: Date(timeIntervalSinceReferenceDate: 0)))"
+    }
+
+    var isAtRisk: Bool {
+        exhausted || runsOutIn != nil
+    }
+}
+
+/// Same model as the server's depletion math (`safe_usage_percent` = elapsed share of the window),
+/// using the average burn rate since the window started.
+func quotaPace(remainingPercent: Double, resetAt: Date?, windowMinutes: Int?, now: Date = Date()) -> QuotaPace? {
+    guard let resetAt, let windowMinutes, windowMinutes > 0 else {
+        return nil
+    }
+    let window = TimeInterval(windowMinutes) * 60
+    let untilReset = resetAt.timeIntervalSince(now)
+    let elapsed = window - untilReset
+    // Too early (or clock skew): a few minutes of data make wild projections.
+    guard untilReset > 0, elapsed >= min(600, window * 0.05) else {
+        return nil
+    }
+    let remaining = min(max(remainingPercent, 0), 100)
+    let used = 100 - remaining
+    let expectedUsed = min(elapsed / window, 1) * 100
+    if remaining <= 0 {
+        return QuotaPace(expectedRemainingPercent: 100 - expectedUsed, deltaPercent: expectedUsed - used, runsOutIn: 0, exhausted: true)
+    }
+    let ratePerSecond = used / elapsed
+    var runsOutIn: TimeInterval?
+    if ratePerSecond > 0 {
+        let timeToEmpty = remaining / ratePerSecond
+        runsOutIn = timeToEmpty < untilReset ? timeToEmpty : nil
+    }
+    return QuotaPace(
+        expectedRemainingPercent: 100 - expectedUsed,
+        deltaPercent: expectedUsed - used,
+        runsOutIn: runsOutIn,
+        exhausted: false
+    )
+}
+
+// MARK: - Card and usage formatting
+
+func relativeUpdatedLabel(_ date: Date?, now: Date = Date()) -> String? {
+    guard let date else {
+        return nil
+    }
+    let seconds = max(0, Int(now.timeIntervalSince(date)))
+    if seconds < 60 {
+        return "Updated just now"
+    }
+    if seconds < 3_600 {
+        return "Updated \(seconds / 60)m ago"
+    }
+    return "Updated \(elapsedTime(since: date, now: now)) ago"
+}
+
+/// Compact card label, e.g. "3 resets · 4d 17h" (time until the soonest credit expires).
+func resetCreditSummaryText(count: Int, expiresAt: Date?, now: Date = Date()) -> String? {
+    guard count > 0 else {
+        return nil
+    }
+    let available = count == 1 ? "1 reset" : "\(count) resets"
+    guard let expiresAt else {
+        return available
+    }
+    return "\(available) · \(compactRemaining(until: expiresAt, now: now))"
+}
+
+func formatCompactCount(_ value: Double) -> String {
+    let magnitude = abs(value)
+    let units: [(Double, String)] = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]
+    for (threshold, suffix) in units where magnitude >= threshold {
+        let scaled = value / threshold
+        let text = scaled >= 100 ? String(format: "%.0f", scaled) : String(format: "%.1f", scaled)
+        return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + suffix
+    }
+    return String(Int(round(value)))
+}
+
+func formatUSD(_ value: Double) -> String {
+    if value >= 10_000 {
+        return "$" + formatCompactCount(value)
+    }
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.minimumFractionDigits = 2
+    formatter.maximumFractionDigits = 2
+    formatter.locale = Locale(identifier: "en_US")
+    return "$" + (formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value))
+}
+
+// MARK: - Versions and updates
+
+/// Compares semantic versions like "0.3.1", "v1.24.0", "1.21.0-beta.3". A release sorts after its prereleases.
+func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
+    func split(_ value: String) -> (core: [Int], pre: [String]) {
+        var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("v") || text.hasPrefix("V") {
+            text.removeFirst()
+        }
+        text = String(text.split(separator: "+", maxSplits: 1).first ?? "")
+        let parts = text.split(separator: "-", maxSplits: 1).map(String.init)
+        let core = (parts.first ?? "").split(separator: ".").map { Int($0) ?? 0 }
+        let pre = parts.count > 1 ? parts[1].split(separator: ".").map(String.init) : []
+        return (core, pre)
+    }
+    let a = split(lhs), b = split(rhs)
+    for index in 0..<max(a.core.count, b.core.count, 3) {
+        let x = index < a.core.count ? a.core[index] : 0
+        let y = index < b.core.count ? b.core[index] : 0
+        if x != y {
+            return x < y ? .orderedAscending : .orderedDescending
+        }
+    }
+    switch (a.pre.isEmpty, b.pre.isEmpty) {
+    case (true, true):
+        return .orderedSame
+    case (true, false):
+        return .orderedDescending
+    case (false, true):
+        return .orderedAscending
+    case (false, false):
+        for index in 0..<max(a.pre.count, b.pre.count) {
+            guard index < a.pre.count else { return .orderedAscending }
+            guard index < b.pre.count else { return .orderedDescending }
+            let x = a.pre[index], y = b.pre[index]
+            if x == y { continue }
+            if let xi = Int(x), let yi = Int(y) {
+                return xi < yi ? .orderedAscending : .orderedDescending
+            }
+            return x < y ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+}
+
+func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+    compareVersions(candidate, current) == .orderedDescending
+}
+
+/// Release asset the updater installs: the versioned DMG produced by build-dmg.sh.
+func isAppUpdateAsset(_ name: String) -> Bool {
+    name.hasPrefix("CodexLBStatusBar-") && name.hasSuffix(".dmg")
+}
+
+/// Parses GitHub's `digest` field ("sha256:<hex>").
+func sha256FromDigest(_ digest: String?) -> String? {
+    guard let digest, digest.lowercased().hasPrefix("sha256:") else {
+        return nil
+    }
+    let hex = String(digest.dropFirst(7)).lowercased()
+    return hex.count == 64 && hex.allSatisfy(\.isHexDigit) ? hex : nil
+}
+
+/// Refuses installs from locations that can't be replaced in place (mounted DMG, Gatekeeper translocation).
+func canSelfUpdate(bundlePath: String) -> Bool {
+    bundlePath.hasSuffix(".app") && !bundlePath.hasPrefix("/Volumes/") && !bundlePath.contains("/AppTranslocation/")
+}
+
+// MARK: - Appearance
+
+enum AppTheme: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    var title: String {
+        switch self {
+        case .system:
+            return "System"
+        case .light:
+            return "Light"
+        case .dark:
+            return "Dark"
+        }
+    }
+}
+
+/// Maps the 0...1 brightness setting (0.5 = default) to a multiplier for surface fills
+/// (cards, tracks, chart bars): 0 -> 0.4x (dimmer), 0.5 -> 1x, 1 -> 2.2x (brighter).
+func surfaceIntensity(brightness: Double) -> Double {
+    let value = min(max(brightness, 0), 1)
+    return value <= 0.5 ? 0.4 + value * 1.2 : 1 + (value - 0.5) * 2.4
+}
+
+enum UsageChartStyle: String, CaseIterable {
+    case bars
+    case line
+    case area
+
+    var title: String {
+        switch self {
+        case .bars:
+            return "Bars"
+        case .line:
+            return "Line"
+        case .area:
+            return "Area"
+        }
+    }
+}
+
+/// Menu label for the current dashboard session, or nil when signed out.
+func sessionMenuLabel(authenticated: Bool, role: String?) -> String? {
+    guard authenticated else {
+        return nil
+    }
+    switch role {
+    case "admin":
+        return "Signed in as Admin"
+    case "guest":
+        return "Signed in as Guest"
+    default:
+        return "Signed in"
+    }
+}
+
+// MARK: - Account list sort and filter
+
+enum AccountSortOrder: String, CaseIterable {
+    case status
+    case remaining
+    case resetSoonest
+    case name
+
+    var title: String {
+        switch self {
+        case .status:
+            return "Status"
+        case .remaining:
+            return "Remaining"
+        case .resetSoonest:
+            return "Reset soonest"
+        case .name:
+            return "Name"
+        }
+    }
+
+    var next: AccountSortOrder {
+        let all = Self.allCases
+        return all[(all.firstIndex(of: self)! + 1) % all.count]
+    }
+}
+
+enum AccountFilter: String, CaseIterable {
+    case all
+    case attention
+
+    var title: String {
+        switch self {
+        case .all:
+            return "All accounts"
+        case .attention:
+            return "Needs attention"
+        }
+    }
+}
+
+/// Minimal account facts for ordering, decoupled from the Decodable model so it can be tested.
+struct AccountSortKey {
+    let id: String
+    let name: String
+    let status: String
+    let primaryRemaining: Double?
+    let secondaryRemaining: Double?
+    let primaryResetAt: Date?
+    let secondaryResetAt: Date?
+
+    /// The window that limits the account right now (lowest remaining).
+    var bottleneckRemaining: Double? {
+        [primaryRemaining, secondaryRemaining].compactMap { $0 }.min()
+    }
+
+    var bottleneckResetAt: Date? {
+        switch (primaryRemaining, secondaryRemaining) {
+        case let (p?, s?):
+            return p <= s ? primaryResetAt ?? secondaryResetAt : secondaryResetAt ?? primaryResetAt
+        case (_?, nil):
+            return primaryResetAt
+        case (nil, _?):
+            return secondaryResetAt
+        default:
+            return [primaryResetAt, secondaryResetAt].compactMap { $0 }.min()
+        }
+    }
+
+    /// Anything the operator may want to look at: not serving normally, or nearly out.
+    var needsAttention: Bool {
+        status != "active" || (bottleneckRemaining ?? 100) < 30
+    }
+}
+
+private func statusRank(_ status: String) -> Int {
+    switch status {
+    case "active":
+        return 0
+    case "rate_limited", "quota_exceeded":
+        return 1
+    case "paused":
+        return 2
+    default:
+        return 3
+    }
+}
+
+/// Returns account ids in display order after filtering.
+func orderedAccountIDs(_ keys: [AccountSortKey], sort: AccountSortOrder, filter: AccountFilter) -> [String] {
+    let filtered = filter == .attention ? keys.filter(\.needsAttention) : keys
+    func byName(_ a: AccountSortKey, _ b: AccountSortKey) -> Bool {
+        a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+    }
+    let sorted = filtered.sorted { a, b in
+        switch sort {
+        case .status:
+            let ra = statusRank(a.status), rb = statusRank(b.status)
+            return ra != rb ? ra < rb : byName(a, b)
+        case .remaining:
+            // Most headroom first; accounts without data last.
+            let x = a.bottleneckRemaining ?? -1, y = b.bottleneckRemaining ?? -1
+            return x != y ? x > y : byName(a, b)
+        case .resetSoonest:
+            let x = a.bottleneckResetAt ?? .distantFuture, y = b.bottleneckResetAt ?? .distantFuture
+            return x != y ? x < y : byName(a, b)
+        case .name:
+            return byName(a, b)
+        }
+    }
+    return sorted.map(\.id)
+}
+
+// MARK: - Reset credit expiry alerts
+
+let resetCreditExpiryWarning: TimeInterval = 24 * 3_600
+
+/// Stable key per credit batch, so each upcoming expiry alerts once.
+func resetCreditExpiryAlertKey(accountId: String, expiresAt: Date) -> String {
+    "\(accountId)|\(Int(expiresAt.timeIntervalSince1970))"
+}
+
+/// True when unused credits expire within the warning window (and haven't expired yet).
+func resetCreditExpiresSoon(count: Int, expiresAt: Date?, now: Date = Date()) -> Bool {
+    guard count > 0, let expiresAt else {
+        return false
+    }
+    let remaining = expiresAt.timeIntervalSince(now)
+    return remaining > 0 && remaining <= resetCreditExpiryWarning
+}
+
+// MARK: - Offline
+
+/// "Offline · data from 5m ago" style caption for stale data after a failed refresh.
+func staleDataLabel(lastSuccess: Date?, now: Date = Date()) -> String {
+    guard let lastSuccess else {
+        return "Offline"
+    }
+    let seconds = max(0, Int(now.timeIntervalSince(lastSuccess)))
+    if seconds < 60 {
+        return "Offline · data from just now"
+    }
+    return "Offline · data from \(elapsedTime(since: lastSuccess, now: now)) ago"
+}

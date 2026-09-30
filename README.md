@@ -1,69 +1,104 @@
-# Codex LB Status Bar
+<p align="center">
+  <img src="assets/icon.png" width="128" height="128" alt="Codex LB Status Bar icon">
+</p>
 
-Current version: **v0.3.0**
+<h1 align="center">Codex LB Status Bar</h1>
 
-Native macOS menu bar app for checking [Codex LB](https://github.com/Soju06/codex-lb) account availability and quota without opening the dashboard.
+<p align="center">
+  A native macOS menu bar app for <a href="https://github.com/Soju06/codex-lb">Codex LB</a>: account quota, pace, reset credits, and account controls without opening the dashboard.
+</p>
 
-![Codex LB Status Bar](assets/statusbar-v0.2.0.png)
+<p align="center">
+  <a href="https://github.com/sm1ee/codex-lb-statusbar/releases/latest"><img src="https://img.shields.io/github/v/release/sm1ee/codex-lb-statusbar?label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/macOS-13%2B-blue" alt="macOS 13+">
+</p>
 
-## Features
-
-- Shows average remaining 5-hour and weekly quota in the menu bar, color-coded per window, with a red `!` when an account needs re-authentication. The average includes rate-limited and quota-exceeded accounts (usually 0%) and excludes paused, re-auth-required, and deactivated accounts.
-- Sends macOS notifications when the average quota drops below 30% / 10% or an account becomes `Re-auth required`/`Deactivated` (toggle via `Notifications` in the menu).
-- Displays account status, routing policy, quota, reset timing, and reset-credit expiry.
-- Uses green, amber, and red quota/status warning levels matching the dashboard.
-- Lets administrators toggle `Active`/`Paused` and cycle `Normal`, `Burn first`, and `Preserve` routing policies from account badges.
-- Lets administrators redeem a reset credit from the `Reset N / …` indicator after a confirmation that shows which credit will be used.
-- Lets administrators re-authenticate `Re-auth required`/`Deactivated` accounts from the status badge via browser OAuth (with callback-URL paste for remote servers) or device code.
-- Refreshes every 60 seconds and supports immediate manual refresh.
-- Supports admin/guest login, configurable server URL, dashboard access, and Launch at Login.
-- Shows the connected Codex LB server version.
-
-Account controls are read-only for guest sessions. Reset credits cannot be used on paused, re-auth-required, or deactivated accounts (same rule as the server).
+<p align="center">
+  <img src="assets/statusbar-v0.3.1.png" width="420" alt="Codex LB Status Bar menu with three example accounts and a usage chart">
+</p>
 
 ## Install
 
-1. Download `CodexLBStatusBar-0.3.0.dmg` from the [v0.3.0 release](https://github.com/sm1ee/codex-lb-statusbar/releases/tag/v0.3.0).
-2. Open the DMG and drag `CodexLBStatusBar.app` to `Applications`.
-3. Start Codex LB, then open the status bar app. The default server URL is `http://127.0.0.1:2455`.
-   The app is ad-hoc signed, so on first launch macOS may block it; right-click the app and choose `Open`, or allow it in `System Settings > Privacy & Security`.
-4. Allow notifications when prompted (or later in `System Settings > Notifications > Codex LB Status`).
-5. Use `Admin Login...` or `Guest Login...` when authentication is required. Reset credits and re-authentication require an admin session.
+```bash
+brew install --cask sm1ee/tap/codex-lb-statusbar
+```
 
-Requires macOS 13 or later and a running Codex LB server.
+Or download `CodexLBStatusBar-<version>.dmg` from the [latest release](https://github.com/sm1ee/codex-lb-statusbar/releases/latest) and drag the app to `Applications`.
+
+On first launch:
+
+1. The app is ad-hoc signed, not notarized, so macOS may block it. Open `System Settings > Privacy & Security` and choose `Open Anyway`.
+2. Allow notifications when prompted.
+3. The default server is `http://127.0.0.1:2455`. Change it in `Settings...` (⌘,) if Codex LB runs elsewhere, then sign in with `Admin Login...` or `Guest Login...`.
+
+Requires macOS 13 or later and a running Codex LB server. After installing, the app updates itself.
+
+## Features
+
+**Menu bar**
+- Average remaining quota (5h / weekly) as text, a compact meter, or both, with `!` when an account needs re-authentication.
+- The average counts rate-limited and quota-exceeded accounts (usually 0%) and leaves out paused, re-auth-required, and deactivated ones, so it doesn't jump when an account runs dry.
+- Colors: `Warnings Only` (default), `Full Color`, or `Monochrome`. Each item can be hidden.
+- `⌥⌘L` opens the menu from anywhere.
+
+**Accounts**
+- Status, routing policy, quota, reset timing, and pace per window (`On pace`, `N% in reserve`, `Runs out in …`), with an even-pace tick on each bar.
+- Sort by status, remaining quota, soonest reset, or name, or show only accounts that need attention.
+- Admin controls: pause/resume, cycle routing policy, and use a reset credit (with a confirmation showing which credit is used).
+- Re-authenticate expired accounts from the status badge via browser OAuth (paste the callback URL for remote servers) or device code.
+- Right-click a card to open it in the dashboard, copy email/ID, rename, toggle limit warm-up, or use a reset credit.
+
+**Usage**
+- Cost, tokens, requests, error rate, and a bar, line, or area token chart for the last 24 hours, 7 days, or 30 days.
+
+**Alerts**
+- Average quota below 30% / 10%.
+- An account becomes re-auth-required or deactivated.
+- Unused reset credits expire within 24 hours.
+- A new Codex LB server release is available.
+
+**App**
+- Refreshes every 60 seconds. When the server is unreachable, the last data stays visible, dimmed, with its age.
+- Theme follows the system or is forced to Light/Dark, with a brightness slider.
+- Self-updates from GitHub Releases, and checks the connected Codex LB server for updates.
+- Remembers the dashboard login in the macOS Keychain per server.
+
+Guest sessions are read-only. Reset credits can't be used on paused, re-auth-required, or deactivated accounts (the same rule as the server).
+
+## Security and privacy
+
+- The app talks only to your Codex LB server and to GitHub (`api.github.com` for update checks and release downloads).
+- Admin and password-protected guest passwords are stored in the macOS Keychain, keyed by server URL. Remove them with `Settings > Forget Saved Login`. TOTP is always prompted.
+- Updates are installed only when the DMG's SHA-256 matches the digest GitHub publishes for the release asset, the bundle identifier and version match the release, and the code signature is valid. The app is ad-hoc signed, so this checks integrity, not publisher identity.
+- Updating in place requires the app to run from a writable folder such as `/Applications`.
+- Other preferences are stored in `UserDefaults` for the current user.
+
+## How it works
+
+- **Pace** uses the average burn rate since the window started. The tick marks where remaining quota would be at an even pace.
+- **Quota alerts** fire once per threshold crossing and re-arm after the average recovers 5 points. Nothing is sent for the state seen at launch.
+- **Browser re-authentication** relies on the Codex LB server's `localhost:1455` OAuth callback. If the server runs on another machine, paste the final callback URL into the app or use device code.
+- **Server update checks** use the server's `/api/runtime/version`, and fall back to GitHub Releases on older servers.
 
 ## Build
 
-Install Xcode command line tools, then run:
+Requires the Xcode command line tools.
 
 ```bash
-./build-dmg.sh
+./build-dmg.sh                        # build/CodexLBStatusBar.app and dist/CodexLBStatusBar-<version>.dmg
+swiftc StatusBarLogic.swift StatusBarLogicTests.swift -o /tmp/statusbar-logic-tests && /tmp/statusbar-logic-tests
+packaging/homebrew/render-cask.sh     # cask for the built DMG
 ```
 
-Outputs:
+The version comes from `VERSION`.
 
-- `build/CodexLBStatusBar.app`
-- `dist/CodexLBStatusBar-0.3.0.dmg`
-
-Run the focused logic checks with:
-
-```bash
-swiftc StatusBarLogic.swift StatusBarLogicTests.swift -o /tmp/statusbar-logic-tests
-/tmp/statusbar-logic-tests
-```
-
-## Runtime Notes
-
-- The server URL and notification preference are stored in `UserDefaults` for the current macOS user.
-- Quota notifications fire once per threshold crossing and re-arm after the average recovers 5 points above it; nothing is sent for the state seen at launch.
-- Browser re-authentication relies on the Codex LB server's `localhost:1455` OAuth callback. When the server runs on another machine, paste the final callback URL into the app or use device code.
-- After a successful admin or password-protected guest login, the password is stored in macOS Keychain for that server URL. The last selected login role is restored when the session expires; passwordless guest access is remembered without storing a password. TOTP still requires a code when enabled.
-- `Launch at Login` uses the native macOS login-item service.
-- Error and empty states are shown in English.
-
-## Project Files
-
-- `CodexLBStatusBar.swift`: menu bar UI, API client, dashboard login, reset-credit and OAuth re-auth flows, notifications, and login-item integration
-- `StatusBarLogic.swift`: quota aggregation, status-bar title segments, alert thresholds, reset-credit gating, and formatting logic
-- `StatusBarLogicTests.swift`: focused logic checks
-- `build-dmg.sh`: versioned app bundle and DMG packaging
+| File | Purpose |
+|---|---|
+| `CodexLBStatusBar.swift` | Menu bar UI, settings window, API client, login, reset-credit and re-auth flows, notifications |
+| `StatusBarLogic.swift` | Quota aggregation, pace, sorting, alert rules, version comparison, formatting |
+| `StatusBarLogicTests.swift` | Logic checks |
+| `AppUpdater.swift` | GitHub Releases self-updater |
+| `GlobalHotKey.swift` | `⌥⌘L` shortcut |
+| `build-dmg.sh` | App bundle, ad-hoc signing, DMG |
+| `assets/make-icon.swift` | Renders `assets/AppIcon.icns` (delete the `.icns` to regenerate) |
+| `packaging/homebrew/` | Homebrew cask template |

@@ -19,10 +19,10 @@ private final class SettingsStore {
     private let notificationsKey = "codexLBNotificationsEnabled"
     private let colorModeKey = "codexLBStatusBarColorMode"
     private let loginRolesKey = "codexLBLoginRolesByURL"
-    private let styleKey = "codexLBStatusBarStyle"
+    private let componentsKey = "codexLBStatusBarComponents"
+    private let meterStyleKey = "codexLBMeterStyle"
     private let showPrimaryKey = "codexLBStatusBarShowPrimary"
     private let showSecondaryKey = "codexLBStatusBarShowSecondary"
-    private let showCountKey = "codexLBStatusBarShowAccountCount"
     private let showUsageKey = "codexLBShowUsageSummary"
     private let usagePeriodKey = "codexLBUsagePeriod"
     private let autoUpdateKey = "codexLBAutoCheckUpdates"
@@ -89,23 +89,57 @@ private final class SettingsStore {
         set { defaults.set(newValue, forKey: notifiedServerVersionKey) }
     }
 
-    var statusBarStyle: StatusBarStyle {
-        get { defaults.string(forKey: styleKey).flatMap(StatusBarStyle.init(rawValue:)) ?? .text }
-        set { defaults.set(newValue.rawValue, forKey: styleKey) }
+    var statusBarComponents: StatusBarComponents {
+        get {
+            if let raw = defaults.string(forKey: componentsKey) {
+                return StatusBarComponents(rawValue: raw)
+            }
+            // Migrate the pre-0.4 style key: Meter -> usage, Text -> no usage bar.
+            let legacy = defaults.string(forKey: "codexLBStatusBarStyle")
+            let components = StatusBarComponents(
+                usage: legacy != nil && legacy != "text",
+                chart: false
+            )
+            defaults.set(components.rawValue, forKey: componentsKey)
+            defaults.removeObject(forKey: "codexLBStatusBarStyle")
+            defaults.removeObject(forKey: "codexLBStatusBarShowAccountCount")
+            return components
+        }
+        set { defaults.set(newValue.rawValue, forKey: componentsKey) }
+    }
+
+    var meterStyle: MeterStyle {
+        get {
+            guard let raw = defaults.string(forKey: meterStyleKey) else {
+                return .combined
+            }
+            // "bars" merged into "pill" (one rounded bar per window) in 0.4.
+            if raw == "bars" {
+                return .combined
+            }
+            return MeterStyle(rawValue: raw) ?? .combined
+        }
+        set { defaults.set(newValue.rawValue, forKey: meterStyleKey) }
+    }
+
+    private let accountsSortKey = "codexLBAccountsSort"
+
+    /// Orders the accounts meter (usage, name, or server order).
+    var accountsSort: AccountMeterSort {
+        get { defaults.string(forKey: accountsSortKey).flatMap(AccountMeterSort.init(rawValue:)) ?? .usage }
+        set { defaults.set(newValue.rawValue, forKey: accountsSortKey) }
     }
 
     var statusBarItems: StatusBarItems {
         get {
             StatusBarItems(
                 primary: defaults.object(forKey: showPrimaryKey) as? Bool ?? true,
-                secondary: defaults.object(forKey: showSecondaryKey) as? Bool ?? true,
-                accountCount: defaults.object(forKey: showCountKey) as? Bool ?? true
+                secondary: defaults.object(forKey: showSecondaryKey) as? Bool ?? true
             )
         }
         set {
             defaults.set(newValue.primary, forKey: showPrimaryKey)
             defaults.set(newValue.secondary, forKey: showSecondaryKey)
-            defaults.set(newValue.accountCount, forKey: showCountKey)
         }
     }
 
@@ -962,6 +996,49 @@ private final class ResetCreditButton: NSButton {
     }
 }
 
+/// Layout constants for the accounts meter image, shared by drawing and status-bar click hit-testing.
+private enum AccountMeterMetrics {
+    /// Horizontal margin between account cells, so each account reads as its own group.
+    static let gap: CGFloat = 12
+    static let percentGap: CGFloat = 4
+    static let overflowWidth: CGFloat = 24
+    static let percentFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+    /// Both accounts styles use the same bar width; the labeled one just adds the name above.
+    static let barWidth: CGFloat = 42
+
+    /// Width of a label in the meter font, so labels are cut to the bar they sit above.
+    static func labelWidth(_ text: String) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: labelFont]).width
+    }
+    /// Bar thickness, shared by every usage shape so switching shapes never changes the bar size.
+    static let barHeight: CGFloat = 6
+
+    /// Per-cell widths sized to each percent text, so bars sit close together instead of leaving
+    /// a fixed reserve that looks like a wide gap next to short percents.
+    static func cellWidths(values: [Double?]) -> [CGFloat] {
+        values.map { value in
+            let percent = value.map { "\(Int(round($0)))%" } ?? ""
+            let width = (percent as NSString).size(withAttributes: [.font: percentFont]).width
+            // Whole-point cells: a fractional width pushes every following bar and percent onto a
+            // half pixel, which the 1x menu bar renders as a soft edge.
+            return (barWidth + percentGap + width).rounded(.up)
+        }
+    }
+
+    static func imageWidth(cellWidths: [CGFloat], overflow: Int) -> CGFloat {
+        let widths = cellWidths.isEmpty ? [0] : cellWidths
+        return widths.reduce(0, +) + CGFloat(widths.count - 1) * gap + (overflow > 0 ? overflowWidth : 0)
+    }
+}
+
+/// Menu-bar ink: the label color made opaque. `NSColor.labelColor` carries an alpha of about 0.85
+/// in dark mode, which a bitmap image composites into washed-out text and hairlines — the items
+/// next to ours are drawn opaque by their apps, so ours read as soft.
+private func menuBarInk() -> NSColor {
+    NSColor.labelColor.withAlphaComponent(1)
+}
+
 private final class QuotaProgressView: NSView {
     private let percent: Double?
     private let paceMarker: Double?
@@ -1220,10 +1297,12 @@ private final class AccountCardView: NSView {
             status.toolTip = account.status == "active" ? "Pause account" : "Reactivate account"
         }
 
-        var topViews: [NSView] = [identity, routing]
+        var topViews: [NSView] = [identity]
         if account.securityWorkAuthorized == true {
+            // The cyber-guard shield reads better ahead of the routing/status buttons.
             topViews.append(shieldView())
         }
+        topViews.append(routing)
         topViews.append(status)
         let topRow = NSStackView(views: topViews)
         topRow.orientation = .horizontal
@@ -2170,6 +2249,8 @@ private enum SettingsChange {
     case notifications(Bool)
     case display
     case menuContent(periodChanged: Bool)
+    /// Chart style only repaints: the data is already loaded.
+    case chartStyle
     case checkForUpdates
     case checkServerVersion
     case appearance
@@ -2188,11 +2269,13 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
     private let notifications = NSButton(checkboxWithTitle: "Quota and account alerts", target: nil, action: nil)
     private let autoUpdate = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
     private let hotKeyToggle = NSButton(checkboxWithTitle: "Open menu with \(GlobalHotKey.displayString)", target: nil, action: nil)
-    private let stylePopup = NSPopUpButton()
+    private let showUsageBar = NSButton(title: "Usage", target: nil, action: nil)
+    private let showChart = NSButton(title: "Chart", target: nil, action: nil)
+    private let meterPopup = NSPopUpButton()
+    private let sortPopup = NSPopUpButton()
     private let colorPopup = NSPopUpButton()
     private let showPrimary = NSButton(checkboxWithTitle: "5h", target: nil, action: nil)
     private let showSecondary = NSButton(checkboxWithTitle: "Weekly", target: nil, action: nil)
-    private let showCount = NSButton(checkboxWithTitle: "Accounts (active/total)", target: nil, action: nil)
     private let showUsage = NSButton(checkboxWithTitle: "Show usage summary", target: nil, action: nil)
     private let periodPopup = NSPopUpButton()
     private let chartPopup = NSPopUpButton()
@@ -2207,7 +2290,7 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         self.settings = settings
         self.onChange = onChange
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 480),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -2247,17 +2330,23 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         notifications.state = settings.notificationsEnabled ? .on : .off
         autoUpdate.state = settings.autoCheckUpdates ? .on : .off
         hotKeyToggle.state = settings.globalHotKeyEnabled ? .on : .off
-        stylePopup.selectItem(at: StatusBarStyle.allCases.firstIndex(of: settings.statusBarStyle) ?? 0)
+        let components = settings.statusBarComponents
+        showUsageBar.state = components.usage ? .on : .off
+        showChart.state = components.chart ? .on : .off
+        meterPopup.selectItem(at: MeterStyle.allCases.firstIndex(of: settings.meterStyle) ?? 0)
+        meterPopup.isEnabled = components.usage
+        sortPopup.selectItem(at: AccountMeterSort.allCases.firstIndex(of: settings.accountsSort) ?? 0)
+        sortPopup.isEnabled = components.usage
         colorPopup.selectItem(at: StatusBarColorMode.allCases.firstIndex(of: settings.statusBarColorMode) ?? 0)
         let items = settings.statusBarItems
         showPrimary.state = items.primary ? .on : .off
         showSecondary.state = items.secondary ? .on : .off
-        showCount.state = items.accountCount ? .on : .off
         showUsage.state = settings.showUsageSummary ? .on : .off
         periodPopup.selectItem(at: UsagePeriod.allCases.firstIndex(of: settings.usagePeriod) ?? 1)
         periodPopup.isEnabled = settings.showUsageSummary
         chartPopup.selectItem(at: UsageChartStyle.allCases.firstIndex(of: settings.usageChartStyle) ?? 0)
-        chartPopup.isEnabled = settings.showUsageSummary
+        // The chart style drives both the menu chart and the status-bar sparkline.
+        chartPopup.isEnabled = settings.showUsageSummary || components.chart
         let hasSaved = DashboardPasswordStore.hasAny(for: settings.baseURLString)
         savedLoginLabel.stringValue = hasSaved
             ? "A password for this server is saved in Keychain."
@@ -2288,7 +2377,6 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
             (hotKeyToggle, #selector(hotKeyChanged)),
             (showPrimary, #selector(displayChanged)),
             (showSecondary, #selector(displayChanged)),
-            (showCount, #selector(displayChanged)),
             (showUsage, #selector(menuContentChanged)),
         ] {
             button.target = self
@@ -2296,9 +2384,22 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         }
         launchAtLogin.allowsMixedState = true
 
-        stylePopup.addItems(withTitles: StatusBarStyle.allCases.map(\.title))
-        stylePopup.target = self
-        stylePopup.action = #selector(displayChanged)
+        for button in [showUsageBar, showChart] {
+            button.setButtonType(.pushOnPushOff)
+            button.target = self
+            button.action = #selector(displayChanged)
+        }
+        showUsageBar.toolTip = "Quota usage bar"
+        showChart.toolTip = "Usage sparkline, same data and style as the menu chart"
+        meterPopup.addItems(withTitles: MeterStyle.allCases.map(\.title))
+        for (index, style) in MeterStyle.allCases.enumerated() {
+            meterPopup.item(at: index)?.toolTip = meterStyleTooltip(style)
+        }
+        meterPopup.target = self
+        meterPopup.action = #selector(displayChanged)
+        sortPopup.addItems(withTitles: AccountMeterSort.allCases.map(\.title))
+        sortPopup.target = self
+        sortPopup.action = #selector(displayChanged)
         colorPopup.addItems(withTitles: StatusBarColorMode.allCases.map(\.menuTitle))
         colorPopup.target = self
         colorPopup.action = #selector(displayChanged)
@@ -2332,7 +2433,9 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         let serverVersionRow = NSStackView(views: [serverVersionLabel, checkServer])
         serverVersionRow.spacing = 10
 
-        let showRow = NSStackView(views: [showPrimary, showSecondary, showCount])
+        let styleRow = NSStackView(views: [showUsageBar, showChart])
+        styleRow.spacing = 8
+        let showRow = NSStackView(views: [showPrimary, showSecondary])
         showRow.spacing = 14
         let checkNow = NSButton(title: "Check Now", target: self, action: #selector(checkNow))
         let updateRow = NSStackView(views: [autoUpdate, checkNow])
@@ -2370,14 +2473,16 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
             [NSTextField(labelWithString: "Theme:"), themePopup],
             [NSTextField(labelWithString: "Brightness:"), brightnessRow],
             [header("Status Bar"), NSGridCell.emptyContentView],
-            [NSTextField(labelWithString: "Style:"), stylePopup],
+            [NSTextField(labelWithString: "Style:"), styleRow],
+            [NSTextField(labelWithString: "Usage:"), meterPopup],
             [NSTextField(labelWithString: "Colors:"), colorPopup],
-            [NSGridCell.emptyContentView, caption("Warnings Only colors just the ! and quota below 30%.")],
-            [NSTextField(labelWithString: "Show:"), showRow],
+            [NSGridCell.emptyContentView, caption("Warnings Only colors just the ! and quota below 30%; Usage Only colors only the usage bar.")],
+            [NSTextField(labelWithString: "Windows:"), showRow],
+            [NSTextField(labelWithString: "Chart:"), chartPopup],
+            [NSTextField(labelWithString: "Sort:"), sortPopup],
             [header("Menu"), NSGridCell.emptyContentView],
             [NSGridCell.emptyContentView, showUsage],
             [NSTextField(labelWithString: "Usage period:"), periodPopup],
-            [NSTextField(labelWithString: "Chart:"), chartPopup],
             [header("Login"), NSGridCell.emptyContentView],
             [NSGridCell.emptyContentView, savedLoginLabel],
             [NSGridCell.emptyContentView, forgetButton],
@@ -2438,13 +2543,33 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         onChange(.checkForUpdates)
     }
 
+    private func meterStyleTooltip(_ style: MeterStyle) -> String {
+        switch style {
+        case .combined:
+            return "One rounded bar per shown window (5h, Weekly), stacked"
+        case .combinedPercent:
+            return "The same stacked bars with the first window's percent beside them"
+        case .accounts:
+            return "One bar per account with the percent, in account order"
+        case .accountsLabeled:
+            return "Email prefix above each bar"
+        }
+    }
+
     @objc private func displayChanged() {
-        settings.statusBarStyle = StatusBarStyle.allCases[max(0, stylePopup.indexOfSelectedItem)]
+        settings.statusBarComponents = StatusBarComponents(
+            usage: showUsageBar.state == .on,
+            chart: showChart.state == .on
+        )
+        meterPopup.isEnabled = showUsageBar.state == .on
+        sortPopup.isEnabled = showUsageBar.state == .on
+        chartPopup.isEnabled = settings.showUsageSummary || showChart.state == .on
+        settings.meterStyle = MeterStyle.allCases[max(0, meterPopup.indexOfSelectedItem)]
+        settings.accountsSort = AccountMeterSort.allCases[max(0, sortPopup.indexOfSelectedItem)]
         settings.statusBarColorMode = StatusBarColorMode.allCases[max(0, colorPopup.indexOfSelectedItem)]
         settings.statusBarItems = StatusBarItems(
             primary: showPrimary.state == .on,
-            secondary: showSecondary.state == .on,
-            accountCount: showCount.state == .on
+            secondary: showSecondary.state == .on
         )
         onChange(.display)
     }
@@ -2458,7 +2583,7 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
 
     @objc private func chartStyleChanged() {
         settings.usageChartStyle = UsageChartStyle.allCases[max(0, chartPopup.indexOfSelectedItem)]
-        onChange(.menuContent(periodChanged: false))
+        onChange(.chartStyle)
     }
 
     @objc private func periodChanged() {
@@ -2551,6 +2676,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var offlineSince: Date?
     private var hotKey: GlobalHotKey?
     private var rightClickMonitor: Any?
+    private var statusClickMonitor: Any?
+    /// Account ids in the order the accounts meter draws them, for click-to-open-account-menu.
+    private var statusBarAccountIDs: [String] = []
+    /// Per-cell widths of the accounts meter, for click hit-testing.
+    private var statusBarCellWidths: [CGFloat] = []
+    /// Width of the meter portion of the status image (the graph, if shown, sits to its right).
+    private var statusBarMeterWidth: CGFloat = 0
     private var lastServerVersionCheck: Date?
     private var settingsWindow: SettingsWindowController?
 
@@ -2562,6 +2694,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         notifier.configure()
         installEditMenu()
+        // Clicking one of the accounts meter's bars opens that account's action menu instead of
+        // the main menu. Menu tracking swallows mouseDown, so intercept from a local monitor.
+        statusClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, let button = self.statusItem.button,
+                  let window = event.window, window === button.window else {
+                return event
+            }
+            let point = button.convert(event.locationInWindow, from: nil)
+            if let index = self.statusBarAccountIndex(at: point, in: button) {
+                self.showAccountMenu(self.statusBarAccountIDs[index])
+                return nil
+            }
+            return event
+        }
         applyAppearance()
         updateGlobalHotKey()
         // Layer colors are resolved once per build, so rebuild when System theme flips light/dark.
@@ -2581,7 +2727,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             try? await Task.sleep(nanoseconds: 15_000_000_000)
             await checkForUpdates(userInitiated: false)
         }
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.refresh()
             }
@@ -2731,14 +2877,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateStatusTitle() {
         guard let overview else {
+            statusBarAccountIDs = []
+            statusBarCellWidths = []
+            statusBarMeterWidth = 0
             setStatusTitle(latestError == nil ? "Status" : "Error")
             return
         }
 
         let summary = QuotaSummary(accounts: overview.accounts)
-        let style = settings.statusBarStyle
+        let components = settings.statusBarComponents
         let items = settings.statusBarItems
         let colorMode = settings.statusBarColorMode
+        let meterStyle = settings.meterStyle
         let segments = statusTitleSegments(
             primary: summary.primary,
             secondary: summary.secondary,
@@ -2747,7 +2897,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             totalCount: overview.accounts.count,
             attentionCount: summary.attentionCount,
             items: items,
-            style: style
+            components: components
         )
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
         let title = NSMutableAttributedString()
@@ -2767,27 +2917,75 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         var meterValues: [Double?] = []
-        if style != .text {
-            if items.primary, summary.primary != nil { meterValues.append(summary.primary) }
-            if items.secondary, summary.secondary != nil { meterValues.append(summary.secondary) }
-            if meterValues.isEmpty, items.primary || items.secondary, let monthly = summary.monthly {
-                meterValues.append(monthly)
+        var accountLabels: [String?] = []
+        var accountOverflow = 0
+        if components.usage {
+            if meterStyle == .accounts || meterStyle == .accountsLabeled {
+                // One bar per counted account, worst first (see `statusBarAccountMeter`).
+                let keys = overview.accounts.map { account in
+                    let remaining: Double?
+                    if items.primary {
+                        remaining = account.usage?.primaryRemainingPercent
+                            ?? account.usage?.secondaryRemainingPercent
+                            ?? account.usage?.monthlyRemainingPercent
+                    } else if items.secondary {
+                        remaining = account.usage?.secondaryRemainingPercent
+                            ?? account.usage?.monthlyRemainingPercent
+                    } else {
+                        remaining = account.usage?.monthlyRemainingPercent
+                    }
+                    // The label follows the account's display name: the alias when set, else the email
+                    // prefix, cut to the width of the bar it sits above.
+                    let label: String?
+                    if let alias = account.alias, !alias.isEmpty {
+                        label = accountMeterLabel(alias, maxWidth: AccountMeterMetrics.barWidth, width: AccountMeterMetrics.labelWidth)
+                    } else {
+                        label = accountMeterLabel(email: account.email, maxWidth: AccountMeterMetrics.barWidth, width: AccountMeterMetrics.labelWidth)
+                    }
+                    return AccountQuotaKey(status: account.status, remaining: remaining, label: label, accountId: account.accountId)
+                }
+                let meter = statusBarAccountMeter(keys, sort: settings.accountsSort)
+                meterValues = meter.entries.isEmpty ? [nil] : meter.entries.map(\.value)
+                accountLabels = meter.entries.map(\.label)
+                accountOverflow = meter.overflow
+                statusBarAccountIDs = meter.entries.compactMap(\.accountId)
+                statusBarCellWidths = AccountMeterMetrics.cellWidths(values: meterValues)
+                statusBarMeterWidth = AccountMeterMetrics.imageWidth(cellWidths: statusBarCellWidths, overflow: accountOverflow)
+            } else {
+                statusBarAccountIDs = []
+                statusBarCellWidths = []
+                statusBarMeterWidth = 0
+                if items.primary, summary.primary != nil { meterValues.append(summary.primary) }
+                if items.secondary, summary.secondary != nil { meterValues.append(summary.secondary) }
+                if meterValues.isEmpty, items.primary || items.secondary, let monthly = summary.monthly {
+                    meterValues.append(monthly)
+                }
+                if meterValues.isEmpty {
+                    // Keep the item visible and clickable even when every window is hidden or unknown.
+                    meterValues.append(summary.primary ?? summary.secondary ?? summary.monthly)
+                }
             }
-            if meterValues.isEmpty {
-                // Keep the item visible and clickable even when every window is hidden or unknown.
-                meterValues.append(summary.primary ?? summary.secondary ?? summary.monthly)
+        }
+        var graphPoints: [Double]?
+        if components.chart {
+            let points = (overview.trends?.tokens ?? []).sorted { $0.t < $1.t }.map(\.v)
+            if points.count >= 2 {
+                graphPoints = points
             }
         }
         let button = statusItem.button
-        if meterValues.isEmpty {
-            button?.image = nil
-            button?.imagePosition = .noImage
-        } else {
-            button?.image = quotaMeterImage(meterValues, colorMode: colorMode)
+        // The app logo marks the item when every component is off, keeping it visible/clickable.
+        let statusImage = statusBarImage(meterValues: meterValues, meterStyle: meterStyle, graphPoints: graphPoints, chartStyle: settings.usageChartStyle, colorMode: colorMode, overflowCount: accountOverflow, labels: accountLabels)
+            ?? (components.usage || components.chart ? nil : statusBarLogoImage())
+        if let image = statusImage {
+            button?.image = image
             button?.imagePosition = title.length == 0 ? .imageOnly : .imageLeading
             if title.length > 0 {
                 title.insert(NSAttributedString(string: " ", attributes: [.font: font]), at: 0)
             }
+        } else {
+            button?.image = nil
+            button?.imagePosition = .noImage
         }
         if offlineSince != nil {
             title.addAttribute(.foregroundColor, value: NSColor.labelColor.withAlphaComponent(0.4),
@@ -2800,6 +2998,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             "5h \(summary.primary.map(formatPercent) ?? "--") · Weekly \(summary.secondary.map(formatPercent) ?? "--")",
             "Average remaining across \(summary.countedCount) usable account(s); paused and re-auth accounts are excluded.",
         ]
+        if meterStyle == .accounts || meterStyle == .accountsLabeled {
+            var perAccount = overview.accounts
+                .filter { isCountedForQuota(status: $0.status) }
+                .compactMap { account -> (Double, String)? in
+                    guard let remaining = account.usage?.primaryRemainingPercent
+                        ?? account.usage?.secondaryRemainingPercent
+                        ?? account.usage?.monthlyRemainingPercent else {
+                        return nil
+                    }
+                    // The tooltip has room for the whole name, unlike the bar label.
+                    let label = account.alias.flatMap { $0.isEmpty ? nil : $0 } ?? accountEmailPrefix(account.email)
+                    let text = label.map { "\($0) \(formatPercent(remaining))" } ?? formatPercent(remaining)
+                    return (remaining, text)
+                }
+            switch settings.accountsSort {
+            case .usage:
+                perAccount.sort { $0.0 < $1.0 }
+            case .usageBest:
+                perAccount.sort { $0.0 > $1.0 }
+            case .name:
+                perAccount.sort { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+            case .server:
+                break
+            }
+            if !perAccount.isEmpty {
+                tooltip.insert("Accounts: \(perAccount.map(\.1).joined(separator: " · "))", at: 1)
+            }
+        }
         if summary.attentionCount > 0 {
             tooltip.append("\(summary.attentionCount) account(s) need re-authentication.")
         }
@@ -2809,36 +3035,256 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         button?.toolTip = tooltip.joined(separator: "\n")
     }
 
-    /// Stacked horizontal bars (one per window). Monochrome renders as a template image so macOS tints it.
-    private func quotaMeterImage(_ values: [Double?], colorMode: StatusBarColorMode) -> NSImage {
-        let width: CGFloat = 22
-        let height: CGFloat = 16
-        let barHeight: CGFloat = values.count == 1 ? 6 : 5
-        let gap: CGFloat = 3
-        let tones = values.map { $0.map { statusSegmentTone(.quota(quotaTone(for: $0)), mode: colorMode) } ?? nil }
-        let isTemplate = tones.allSatisfy { $0 == nil }
-        let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { [weak self] _ in
-            let total = CGFloat(values.count) * barHeight + CGFloat(values.count - 1) * gap
-            var y = (height + total) / 2 - barHeight
-            for (index, value) in values.enumerated() {
-                let track = NSRect(x: 0.5, y: y, width: width - 1, height: barHeight)
-                (isTemplate ? NSColor.black.withAlphaComponent(0.3) : NSColor.labelColor.withAlphaComponent(0.25)).setFill()
-                NSBezierPath(roundedRect: track, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
-                if let value {
-                    let fraction = CGFloat(min(max(value, 0), 100) / 100)
-                    var fill = track
-                    fill.size.width = max(fraction > 0 ? barHeight : 0, track.width * fraction)
-                    let color = tones[index].flatMap { self?.menuBarColor($0) } ?? (isTemplate ? .black : .labelColor)
-                    color.setFill()
-                    NSBezierPath(roundedRect: fill, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
-                }
-                y -= barHeight + gap
+    /// Bitmap-backed image with a 1x and a 2x representation. Drawing into explicit reps (rather
+    /// than through `NSImage(size:flipped:handler:)`) keeps glyphs and hairlines on whole pixels:
+    /// the handler path rasterizes text with a sub-pixel shift, which the 1x menu bar renders as a
+    /// soft, washed-out glyph next to the text other menu-bar apps draw.
+    private func menuBarImage(width: CGFloat, height: CGFloat, draw: () -> Void) -> NSImage {
+        let size = NSSize(width: width.rounded(), height: height.rounded())
+        let image = NSImage(size: size)
+        for scale in 1...2 {
+            guard let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: Int(size.width) * scale, pixelsHigh: Int(size.height) * scale,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+            ) else {
+                continue
             }
-            return true
+            rep.size = size
+            image.addRepresentation(rep)
+            NSGraphicsContext.saveGraphicsState()
+            // The context maps the point-size box onto the pixel buffer by itself (1x, 2x).
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            draw()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        return image
+    }
+
+    /// Meter image for the chosen shape. Monochrome renders as a template image so macOS tints it.
+    private func quotaMeterImage(_ values: [Double?], meterStyle: MeterStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil) -> NSImage {
+        let tones = values.map { $0.map { statusMeterTone(quotaTone(for: $0), mode: colorMode) } ?? nil }
+        let isTemplate = tones.allSatisfy { $0 == nil }
+        let image: NSImage
+        switch meterStyle {
+        case .combined, .combinedPercent:
+            // One rounded bar per shown window (5h, Weekly), stacked; `.combinedPercent` adds the
+            // first window's percent beside them.
+            let height: CGFloat = 19
+            let barHeight = AccountMeterMetrics.barHeight
+            let gap: CGFloat = 3
+            let barWidth: CGFloat = 34
+            let count = max(values.count, 1)
+            let percentText = meterStyle == .combinedPercent
+                ? (values.first ?? nil).map { "\(Int(round($0)))%" } ?? ""
+                : ""
+            let percentWidth = percentText.isEmpty
+                ? 0
+                : AccountMeterMetrics.percentGap + (percentText as NSString).size(withAttributes: [.font: AccountMeterMetrics.percentFont]).width.rounded(.up)
+            image = menuBarImage(width: barWidth + percentWidth, height: height) { [weak self] in
+                let total = CGFloat(count) * barHeight + CGFloat(count - 1) * gap
+                // Whole-point origin: a half-point would soften both bar edges at 1x.
+                var y = ((height - total) / 2).rounded() + total - barHeight
+                for (index, value) in values.enumerated() {
+                    let track = NSRect(x: 0, y: y, width: barWidth, height: barHeight)
+                    menuBarInk().withAlphaComponent(0.25).setFill()
+                    NSBezierPath(roundedRect: track, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+                    if let value {
+                        let fraction = CGFloat(min(max(value, 0), 100) / 100)
+                        var fill = track
+                        fill.size.width = max(fraction > 0 ? barHeight : 0, track.width * fraction)
+                        let color = tones[index].flatMap { self?.menuBarColor($0) } ?? menuBarInk()
+                        color.setFill()
+                        NSBezierPath(roundedRect: fill, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+                    }
+                    y -= barHeight + gap
+                }
+                if !percentText.isEmpty {
+                    let size = (percentText as NSString).size(withAttributes: [.font: AccountMeterMetrics.percentFont])
+                    (percentText as NSString).draw(
+                        at: NSPoint(x: barWidth + AccountMeterMetrics.percentGap, y: ((height - size.height) / 2).rounded()),
+                        withAttributes: [.font: AccountMeterMetrics.percentFont, .foregroundColor: menuBarInk()]
+                    )
+                }
+            }
+        case .accounts, .accountsLabeled:
+            // One bar per counted account in a single row, in the server's account order
+            // (see `statusBarAccountMeter`), up to 10 bars then a `+N` marker. Each bar shows the
+            // percent beside it like the account cards; `.accountsLabeled` adds the email prefix
+            // above the bar (and widens the bars so the longest label fits without clipping).
+            let showsLabel = meterStyle == .accountsLabeled
+            let height: CGFloat = showsLabel ? 20 : 18
+            let barHeight: CGFloat = 6
+            let gap = AccountMeterMetrics.gap
+            let barWidth = AccountMeterMetrics.barWidth
+            let percentGap = AccountMeterMetrics.percentGap
+            let cellWidths = AccountMeterMetrics.cellWidths(values: values)
+            let width = AccountMeterMetrics.imageWidth(cellWidths: cellWidths, overflow: overflowCount)
+            image = menuBarImage(width: width, height: height) { [weak self] in
+                let barY: CGFloat = showsLabel ? 2 : (height - barHeight) / 2
+                let percentFont = AccountMeterMetrics.percentFont
+                var x: CGFloat = 0
+                for (index, value) in values.enumerated() {
+                    let track = NSRect(x: x, y: barY, width: barWidth, height: barHeight)
+                    menuBarInk().withAlphaComponent(0.25).setFill()
+                    NSBezierPath(roundedRect: track, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+                    if let value {
+                        let fraction = CGFloat(min(max(value, 0), 100) / 100)
+                        var fill = track
+                        fill.size.width = max(fraction > 0 ? barHeight : 0, track.width * fraction)
+                        let color = tones[index].flatMap { self?.menuBarColor($0) } ?? menuBarInk()
+                        color.setFill()
+                        NSBezierPath(roundedRect: fill, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+                        let percent = "\(Int(round(value)))%" as NSString
+                        let size = percent.size(withAttributes: [.font: percentFont])
+                        // Whole-point origin: a half-point would soften the glyphs, which stands out
+                        // next to the text the other menu-bar apps draw on the pixel grid.
+                        percent.draw(at: NSPoint(x: track.maxX + percentGap, y: ((height - size.height) / 2).rounded()),
+                                     withAttributes: [.font: percentFont, .foregroundColor: menuBarInk()])
+                    }
+                    if showsLabel, let label = labels?[index], !label.isEmpty {
+                        let size = label.size(withAttributes: [.font: AccountMeterMetrics.labelFont])
+                        let labelX = track.minX
+                        let labelY = (height - size.height - 1).rounded()
+                        label.draw(at: NSPoint(x: labelX, y: labelY), withAttributes: [.font: AccountMeterMetrics.labelFont, .foregroundColor: menuBarInk()])
+                    }
+                    x += cellWidths[index] + gap
+                }
+                if overflowCount > 0 {
+                    let text = "+\(overflowCount)" as NSString
+                    let font = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold)
+                    let size = text.size(withAttributes: [.font: font])
+                    text.draw(at: NSPoint(x: x + 4, y: ((height - size.height) / 2).rounded()),
+                              withAttributes: [.font: font, .foregroundColor: menuBarInk()])
+                }
+            }
         }
         image.isTemplate = isTemplate
-        image.accessibilityDescription = "Quota meter"
+        image.accessibilityDescription = "Quota usage"
         return image
+    }
+
+    /// The app icon's mark (terminal prompt + quota bar) as a transparent glyph with a thin
+    /// outline, like the other menu-bar icons: the `>_` prompt follows the label color with bold
+    /// strokes, and the quota bar keeps the icon's signature green.
+    private func statusBarLogoImage() -> NSImage {
+        menuBarImage(width: 18, height: 18) { drawStatusBarLogo() }
+    }
+
+    /// Draws the logo mark in the 18pt box. Odd stroke widths sit on half points (`0.5`, `17.5`)
+    /// so their edges fall on whole pixels at 1x.
+    private func drawStatusBarLogo() {
+        let green = NSColor(srgbRed: 0x12 / 255, green: 0xA1 / 255, blue: 0x50 / 255, alpha: 1)
+        let outline = NSBezierPath(roundedRect: NSRect(x: 0.5, y: 0.5, width: 17, height: 17), xRadius: 6.2, yRadius: 6.2)
+        outline.lineWidth = 1
+        menuBarInk().setStroke()
+        outline.stroke()
+
+        let chevron = NSBezierPath()
+        chevron.move(to: NSPoint(x: 4.5, y: 13.7))
+        chevron.line(to: NSPoint(x: 8.1, y: 10.8))
+        chevron.line(to: NSPoint(x: 4.5, y: 7.9))
+        chevron.lineWidth = 2.2
+        chevron.lineCapStyle = .round
+        chevron.lineJoinStyle = .round
+        menuBarInk().setStroke()
+        chevron.stroke()
+
+        // The cursor straddles the chevron's bottom tip, like the icon's `_`.
+        menuBarInk().setFill()
+        NSBezierPath(roundedRect: NSRect(x: 9.3, y: 6.5, width: 5.4, height: 2.25), xRadius: 1.1, yRadius: 1.1).fill()
+
+        menuBarInk().withAlphaComponent(0.35).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 4.5, y: 3.8, width: 9.7, height: 2.5), xRadius: 1.25, yRadius: 1.25).fill()
+        green.setFill()
+        NSBezierPath(roundedRect: NSRect(x: 4.5, y: 3.8, width: 7.4, height: 2.5), xRadius: 1.25, yRadius: 1.25).fill()
+    }
+
+    /// Tiny token-usage sparkline for the status bar, drawn in the same style as the menu chart.
+    private func usageGraphImage(_ points: [Double], chartStyle: UsageChartStyle) -> NSImage {
+        let width: CGFloat = 26
+        let height: CGFloat = 12
+        // Bars need room between them to read at all; the line keeps full resolution for its curve.
+        let sampleCount = chartStyle == .bars ? 9 : 26
+        let sampled: [Double]
+        if points.count <= sampleCount {
+            sampled = points
+        } else {
+            sampled = (0..<sampleCount).map { points[($0 * (points.count - 1)) / (sampleCount - 1)] }
+        }
+        let peak = max(sampled.max() ?? 0, 1)
+        let image = menuBarImage(width: width, height: height) {
+            switch chartStyle {
+            case .bars:
+                let gap: CGFloat = 1
+                let barWidth = max(1, (width - gap * CGFloat(sampled.count - 1)) / CGFloat(sampled.count))
+                for (index, value) in sampled.enumerated() {
+                    let x = CGFloat(index) * (barWidth + gap)
+                    if value <= 0 {
+                        // A visible baseline keeps the empty stretches readable.
+                        menuBarInk().withAlphaComponent(0.35).setFill()
+                        NSBezierPath(roundedRect: NSRect(x: x, y: 0, width: barWidth, height: 2), xRadius: 1, yRadius: 1).fill()
+                        continue
+                    }
+                    let barHeight = max(2, (height - 1) * CGFloat(value / peak))
+                    menuBarInk().setFill()
+                    NSBezierPath(roundedRect: NSRect(x: x, y: 0, width: barWidth, height: barHeight),
+                                 xRadius: min(1, barWidth / 2), yRadius: min(1, barWidth / 2)).fill()
+                }
+            case .line, .area:
+                let path = NSBezierPath()
+                for (index, value) in sampled.enumerated() {
+                    let x = CGFloat(index) / CGFloat(max(sampled.count - 1, 1)) * (width - 1)
+                    let y = CGFloat(value / peak) * (height - 2) + 1
+                    if index == 0 {
+                        path.move(to: NSPoint(x: x, y: y))
+                    } else {
+                        path.line(to: NSPoint(x: x, y: y))
+                    }
+                }
+                if chartStyle == .area, let area = path.copy() as? NSBezierPath {
+                    area.line(to: NSPoint(x: width - 1, y: 0))
+                    area.line(to: NSPoint(x: 0, y: 0))
+                    area.close()
+                    menuBarInk().withAlphaComponent(0.18).setFill()
+                    area.fill()
+                }
+                path.lineWidth = 1
+                path.lineJoinStyle = .round
+                menuBarInk().setStroke()
+                path.stroke()
+            }
+        }
+        image.accessibilityDescription = "Usage"
+        return image
+    }
+
+    /// Combines the meter and graph into one status-bar image, or nil when neither is shown.
+    private func statusBarImage(meterValues: [Double?], meterStyle: MeterStyle, graphPoints: [Double]?, chartStyle: UsageChartStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil) -> NSImage? {
+        var images: [NSImage] = []
+        if !meterValues.isEmpty {
+            images.append(quotaMeterImage(meterValues, meterStyle: meterStyle, colorMode: colorMode, overflowCount: overflowCount, labels: labels))
+        }
+        if let graphPoints, graphPoints.count >= 2 {
+            images.append(usageGraphImage(graphPoints, chartStyle: chartStyle))
+        }
+        guard !images.isEmpty else { return nil }
+        // The sparkline is drawn edge to edge, so it needs air on both sides: a wider gap after the
+        // meter and a little room before the item's edge.
+        let gap: CGFloat = images.count > 1 ? 8 : 0
+        let trailing: CGFloat = graphPoints == nil ? 0 : 4
+        let height = images.map(\.size.height).max() ?? 0
+        let width = images.reduce(0) { $0 + $1.size.width } + gap * CGFloat(images.count - 1) + trailing
+        let composite = menuBarImage(width: width, height: height) {
+            var x: CGFloat = 0
+            for image in images {
+                let y = (height - image.size.height) / 2
+                image.draw(in: NSRect(x: x, y: y, width: image.size.width, height: image.size.height))
+                x += image.size.width + gap
+            }
+        }
+        composite.isTemplate = images.allSatisfy(\.isTemplate)
+        return composite
     }
 
     private func menuBarColor(_ tone: QuotaTone) -> NSColor {
@@ -3631,6 +4077,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    /// Maps a click inside the status button to an accounts-meter cell, or nil when the click
+    /// isn't on one of the account bars (graph, other meter styles, gaps, the `+N` marker).
+    private func statusBarAccountIndex(at point: NSPoint, in button: NSButton) -> Int? {
+        let style = settings.meterStyle
+        guard (style == .accounts || style == .accountsLabeled),
+              !statusBarAccountIDs.isEmpty,
+              let cell = button.cell else {
+            return nil
+        }
+        let imageRect = cell.imageRect(forBounds: button.bounds)
+        guard imageRect.contains(point) else {
+            return nil
+        }
+        let x = point.x - imageRect.minX
+        guard x < statusBarMeterWidth else {
+            return nil
+        }
+        var cursor: CGFloat = 0
+        for (index, width) in statusBarCellWidths.enumerated() {
+            if x >= cursor, x < cursor + width {
+                return index
+            }
+            cursor += width + AccountMeterMetrics.gap
+        }
+        return nil
+    }
+
     @objc private func openAccountInDashboard(_ sender: NSMenuItem) {
         guard let accountId = sender.representedObject as? String,
               var components = URLComponents(url: settings.baseURL, resolvingAgainstBaseURL: false) else {
@@ -3741,6 +4214,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             } else {
                 rebuildMenu()
             }
+        case .chartStyle:
+            // The style drives both the status-bar sparkline and the menu chart.
+            updateStatusTitle()
+            rebuildMenu()
         case .checkForUpdates:
             Task { await checkForUpdates(userInitiated: true) }
         case .checkServerVersion:

@@ -379,6 +379,8 @@ func dashboardErrorMessage(from body: Data) -> String? {
 enum StatusBarColorMode: String, CaseIterable {
     /// Every quota segment is green/amber/red, plus a red `!`.
     case full
+    /// Only the usage bar is colored; all text (including the `!`) keeps the default menu-bar color.
+    case meterOnly
     /// Plain text; only the `!` and quota below 30% are red.
     case warningsOnly
     /// Plain text everywhere, including the `!`.
@@ -388,6 +390,8 @@ enum StatusBarColorMode: String, CaseIterable {
         switch self {
         case .full:
             return "Full Color"
+        case .meterOnly:
+            return "Usage Only"
         case .warningsOnly:
             return "Warnings Only"
         case .off:
@@ -396,10 +400,10 @@ enum StatusBarColorMode: String, CaseIterable {
     }
 }
 
-/// Color to apply to a status-bar segment, or nil for the default menu-bar text color.
+/// Color to apply to a status-bar text segment, or nil for the default menu-bar text color.
 func statusSegmentTone(_ kind: StatusTitleSegment.Kind, mode: StatusBarColorMode) -> QuotaTone? {
     switch (mode, kind) {
-    case (.off, _), (_, .count):
+    case (.off, _), (.meterOnly, _), (_, .count):
         return nil
     case (_, .attention):
         return .red
@@ -410,33 +414,187 @@ func statusSegmentTone(_ kind: StatusTitleSegment.Kind, mode: StatusBarColorMode
     }
 }
 
+/// Color to apply to the meter image, or nil for the default menu-bar color.
+func statusMeterTone(_ tone: QuotaTone, mode: StatusBarColorMode) -> QuotaTone? {
+    switch mode {
+    case .off:
+        return nil
+    case .full, .meterOnly:
+        return tone
+    case .warningsOnly:
+        return tone == .red ? .red : nil
+    }
+}
+
 // MARK: - Status bar display options
 
-enum StatusBarStyle: String, CaseIterable {
-    case text
-    case meter
-    case meterAndText
+/// Independent status-bar components, OR-combined: each toggle adds its own element
+/// (Usage -> quota bar, Chart -> usage sparkline). Quota text and the account count were removed
+/// as components: the bars show percents, and the app logo appears only when every component
+/// is off, keeping the item visible and clickable.
+struct StatusBarComponents: Equatable {
+    var usage = true
+    var chart = false
 
-    var title: String {
-        switch self {
-        case .text:
-            return "Text"
-        case .meter:
-            return "Meter"
-        case .meterAndText:
-            return "Meter + Text"
-        }
+    /// Comma-joined flag list; an empty string means every component is off.
+    var rawValue: String {
+        var parts: [String] = []
+        if usage { parts.append("usage") }
+        if chart { parts.append("chart") }
+        return parts.joined(separator: ",")
+    }
+
+    init(usage: Bool = true, chart: Bool = false) {
+        self.usage = usage
+        self.chart = chart
+    }
+
+    init(rawValue: String) {
+        let parts = Set(rawValue.split(separator: ",").map(String.init))
+        // "meter" was the pre-rename flag name.
+        usage = parts.contains("usage") || parts.contains("meter")
+        // "graph" was the pre-rename flag name.
+        chart = parts.contains("chart") || parts.contains("graph")
     }
 }
 
 struct StatusBarItems: Equatable {
     var primary = true
     var secondary = true
-    var accountCount = true
 }
 
-/// Segments to render as text for the chosen style. Meter styles draw the quota bars as an image,
-/// so `.meter` keeps only the `!` and account count as text.
+/// Usage bar shapes. `.combined*` stack one rounded bar per shown window (5h, Weekly), with
+/// `.combinedPercent` adding the first window's percent beside them. `.accounts*` draw one bar per
+/// counted account with the percent beside it, optionally with the email prefix above each bar
+/// (the same name + percent + bar layout as the account cards).
+enum MeterStyle: String, CaseIterable {
+    /// Raw values are persisted in the preferences; they stay put across renames.
+    case combined = "pill"
+    case combinedPercent = "pillPercent"
+    case accounts
+    case accountsLabeled
+
+    var title: String {
+        switch self {
+        case .combined:
+            return "Combined"
+        case .combinedPercent:
+            return "Combined + Percent"
+        case .accounts:
+            return "Accounts"
+        case .accountsLabeled:
+            return "Accounts + Name"
+        }
+    }
+}
+
+/// Minimal account facts for the status-bar accounts meter, decoupled from the Decodable model.
+struct AccountQuotaKey {
+    let status: String
+    let remaining: Double?
+    let label: String?
+    let accountId: String?
+
+    init(status: String, remaining: Double?, label: String? = nil, accountId: String? = nil) {
+        self.status = status
+        self.remaining = remaining
+        self.label = label
+        self.accountId = accountId
+    }
+}
+
+/// One bar's value and optional label for the accounts meter.
+struct AccountMeterEntry: Equatable {
+    let value: Double?
+    let label: String?
+    let accountId: String?
+}
+
+/// Accounts meter label: as much of the display string as fits `maxWidth`, measured by `width`,
+/// with a `..` marker taking the last of that budget. Short values come back untouched.
+func accountMeterLabel(_ value: String?, maxWidth: CGFloat, width: (String) -> CGFloat) -> String? {
+    guard let value, !value.isEmpty else {
+        return nil
+    }
+    guard width(value) > maxWidth else {
+        return value
+    }
+    let marker = ".."
+    var kept = ""
+    for character in value {
+        let candidate = kept + String(character)
+        guard width(candidate + marker) <= maxWidth else {
+            break
+        }
+        kept = candidate
+    }
+    // "john.doe" keeps "john", not "john.", so the marker doesn't trail a dot of its own.
+    while kept.hasSuffix(".") {
+        kept.removeLast()
+    }
+    return kept + marker
+}
+
+/// Email local part (before the `@`), or nil when there is no address to shorten.
+func accountEmailPrefix(_ email: String?) -> String? {
+    guard let email, let at = email.firstIndex(of: "@") else {
+        return nil
+    }
+    return String(email[..<at])
+}
+
+/// Accounts meter label from an email: the local part (before `@`), truncated like any label.
+func accountMeterLabel(email: String?, maxWidth: CGFloat, width: (String) -> CGFloat) -> String? {
+    accountEmailPrefix(email).flatMap { accountMeterLabel($0, maxWidth: maxWidth, width: width) }
+}
+
+/// Ordering for the accounts meter.
+enum AccountMeterSort: String, CaseIterable {
+    case usage      // worst first
+    case usageBest  // best first
+    case name       // alphabetical by label
+    case server     // server order
+
+    var title: String {
+        switch self {
+        case .usage:
+            return "Usage (worst first)"
+        case .usageBest:
+            return "Usage (best first)"
+        case .name:
+            return "Name"
+        case .server:
+            return "Server order"
+        }
+    }
+}
+
+/// Per-account remaining percents for the accounts meter: counted accounts only (same rule as the
+/// quota average), capped at `maxBars` with the hidden count returned as `overflow`, ordered by
+/// `sort`.
+func statusBarAccountMeter(_ accounts: [AccountQuotaKey], maxBars: Int = 10, sort: AccountMeterSort = .usage) -> (entries: [AccountMeterEntry], overflow: Int) {
+    var counted = accounts
+        .filter { isCountedForQuota(status: $0.status) }
+        .compactMap { key in key.remaining.map { AccountMeterEntry(value: $0, label: key.label, accountId: key.accountId) } }
+    switch sort {
+    case .usage:
+        counted.sort { ($0.value ?? 0) < ($1.value ?? 0) }
+    case .usageBest:
+        counted.sort { ($0.value ?? 0) > ($1.value ?? 0) }
+    case .name:
+        counted.sort { ($0.label ?? "").localizedCaseInsensitiveCompare($1.label ?? "") == .orderedAscending }
+    case .server:
+        break
+    }
+    guard counted.count > maxBars else {
+        return (counted, 0)
+    }
+    return (Array(counted.prefix(maxBars)), counted.count - maxBars)
+}
+
+/// Segments to render as text for the chosen components. Quota text and the account count are no
+/// longer components (the meters show percents, the logo marks the item), so only the `!` attention
+/// marker can render as text.
 func statusTitleSegments(
     primary: Double?,
     secondary: Double?,
@@ -445,7 +603,7 @@ func statusTitleSegments(
     totalCount: Int,
     attentionCount: Int,
     items: StatusBarItems,
-    style: StatusBarStyle
+    components: StatusBarComponents
 ) -> [StatusTitleSegment] {
     let shownPrimary = items.primary ? primary : nil
     let shownSecondary = items.secondary ? secondary : nil
@@ -459,16 +617,8 @@ func statusTitleSegments(
         totalCount: totalCount,
         attentionCount: attentionCount
     )
-    if style == .meter {
-        segments.removeAll { if case .quota = $0.kind { return true } else { return false } }
-    }
-    if !items.accountCount {
-        segments.removeAll { $0.kind == .count }
-    }
-    if segments.isEmpty && style == .text {
-        // Never render an empty (invisible, unclickable) status item.
-        segments.append(StatusTitleSegment(text: "(\(activeCount)/\(totalCount))", kind: .count))
-    }
+    segments.removeAll { if case .quota = $0.kind { return true } else { return false } }
+    segments.removeAll { $0.kind == .count }
     return segments
 }
 

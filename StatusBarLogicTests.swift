@@ -192,21 +192,79 @@ private enum StatusBarLogicTests {
         for kind: StatusTitleSegment.Kind in [.attention, .quota(.red), .quota(.green), .count] {
             assert(statusSegmentTone(kind, mode: .off) == nil)
         }
+        // Usage Only: text (including the !) stays plain, the usage bar keeps every tone.
+        for kind: StatusTitleSegment.Kind in [.attention, .quota(.red), .quota(.green), .count] {
+            assert(statusSegmentTone(kind, mode: .meterOnly) == nil)
+        }
+        assert(statusMeterTone(.amber, mode: .full) == .amber)
+        assert(statusMeterTone(.amber, mode: .meterOnly) == .amber)
+        assert(statusMeterTone(.red, mode: .meterOnly) == .red)
+        assert(statusMeterTone(.amber, mode: .warningsOnly) == nil)
+        assert(statusMeterTone(.red, mode: .warningsOnly) == .red)
+        assert(statusMeterTone(.green, mode: .off) == nil)
     }
 
     static func displayAndPaceTests() {
         let all = StatusBarItems()
-        func texts(_ items: StatusBarItems, _ style: StatusBarStyle, primary: Double? = 35, secondary: Double? = 8, monthly: Double? = nil, attention: Int = 1) -> [String] {
+        func texts(_ items: StatusBarItems, _ components: StatusBarComponents, primary: Double? = 35, secondary: Double? = 8, monthly: Double? = nil, attention: Int = 1) -> [String] {
             statusTitleSegments(primary: primary, secondary: secondary, monthly: monthly, activeCount: 2, totalCount: 3,
-                                attentionCount: attention, items: items, style: style).map(\.text)
+                                attentionCount: attention, items: items, components: components).map(\.text)
         }
-        assert(texts(all, .text) == ["!", "5h 35%", "W 8%", "(2/3)"])
-        assert(texts(all, .meter) == ["!", "(2/3)"])
-        assert(texts(all, .meterAndText) == ["!", "5h 35%", "W 8%", "(2/3)"])
-        assert(texts(StatusBarItems(primary: true, secondary: false, accountCount: false), .text) == ["!", "5h 35%"])
-        assert(texts(StatusBarItems(primary: false, secondary: false, accountCount: false), .text, attention: 0) == ["(2/3)"])
-        assert(texts(StatusBarItems(primary: false, secondary: false, accountCount: false), .meter, attention: 0).isEmpty)
-        assert(texts(all, .text, primary: nil, secondary: nil, monthly: 50, attention: 0) == ["M 50%", "(2/3)"])
+        // Quota text and the count are no longer components: only the `!` renders as text.
+        assert(texts(all, StatusBarComponents()) == ["!"])
+        assert(texts(all, StatusBarComponents(), attention: 0).isEmpty)
+        assert(texts(all, StatusBarComponents(), primary: nil, secondary: nil, monthly: 50, attention: 0).isEmpty)
+        assert(StatusBarComponents(rawValue: "usage,chart") == StatusBarComponents(usage: true, chart: true))
+        assert(StatusBarComponents(rawValue: "meter,graph") == StatusBarComponents(usage: true, chart: true))  // pre-rename flags
+        assert(StatusBarComponents(rawValue: "text,meter,count,logo") == StatusBarComponents(usage: true))  // legacy flags ignored
+        assert(StatusBarComponents(rawValue: "") == StatusBarComponents(usage: false, chart: false))
+
+        // Accounts meter: counted accounts only, kept in server order, capped with overflow.
+        let accountKeys = [
+            AccountQuotaKey(status: "active", remaining: 88, label: "alice", accountId: "acc-1"),
+            AccountQuotaKey(status: "active", remaining: 36, label: "bob", accountId: "acc-2"),
+            AccountQuotaKey(status: "rate_limited", remaining: 0, label: "carol", accountId: "acc-3"),
+            AccountQuotaKey(status: "paused", remaining: 90, label: "frank", accountId: "acc-4"),
+            AccountQuotaKey(status: "reauth_required", remaining: 80, label: "grace", accountId: "acc-5"),
+            AccountQuotaKey(status: "deactivated", remaining: 70, label: "heidi", accountId: "acc-6"),
+            AccountQuotaKey(status: "active", remaining: nil, label: "ivan", accountId: "acc-7"),
+        ]
+        let meter = statusBarAccountMeter(accountKeys)  // default: usage, worst first
+        assert(meter.entries.map(\.value) == [0, 36, 88].map { $0 as Double? })
+        assert(meter.entries.map(\.label) == ["carol", "bob", "alice"])
+        assert(meter.entries.map(\.accountId) == ["acc-3", "acc-2", "acc-1"])
+        assert(meter.overflow == 0)
+        let server = statusBarAccountMeter(accountKeys, sort: .server)
+        assert(server.entries.map(\.value) == [88, 36, 0].map { $0 as Double? })
+        let best = statusBarAccountMeter(accountKeys, sort: .usageBest)
+        assert(best.entries.map(\.value) == [88, 36, 0].map { $0 as Double? })
+        let byName = statusBarAccountMeter(accountKeys, sort: .name)
+        assert(byName.entries.map(\.label) == ["alice", "bob", "carol"])
+        let many = statusBarAccountMeter((0..<10).map { AccountQuotaKey(status: "active", remaining: Double($0)) })
+        assert(many.entries.map(\.value) == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map { $0 as Double? })
+        assert(many.overflow == 0)
+        let capped = statusBarAccountMeter((0..<20).map { AccountQuotaKey(status: "active", remaining: Double($0)) })
+        assert(capped.entries.map(\.value) == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map { $0 as Double? })
+        assert(capped.overflow == 10)
+        assert(statusBarAccountMeter([]).entries.isEmpty)
+        assert(statusBarAccountMeter([AccountQuotaKey(status: "paused", remaining: 50)]).entries.isEmpty)
+        // Labels keep as much of the name as fits the bar width, marker included (6pt per character
+        // here, 42pt bars).
+        let measure: (String) -> CGFloat = { CGFloat($0.count) * 6 }
+        assert(accountMeterLabel(email: "alice@example.com", maxWidth: 42, width: measure) == "alice")
+        assert(accountMeterLabel(email: "john.doe@example.com", maxWidth: 42, width: measure) == "john..")
+        assert(accountMeterLabel(email: "abcdefgh@example.com", maxWidth: 42, width: measure) == "abcde..")
+        assert(accountMeterLabel(email: "a@example.com", maxWidth: 42, width: measure) == "a")
+        assert(accountMeterLabel("smlee@example.com", maxWidth: 42, width: measure) == "smlee..")
+        assert(accountMeterLabel("smlee", maxWidth: 42, width: measure) == "smlee")
+        assert(accountMeterLabel("", maxWidth: 42, width: measure) == nil)
+        // No room for the marker either: it stands alone rather than dropping the ellipsis.
+        assert(accountMeterLabel("abcdef", maxWidth: 10, width: measure) == "..")
+        assert(accountMeterLabel(email: "@example.com", maxWidth: 42, width: measure) == nil)
+        assert(accountMeterLabel(email: "no-at-sign", maxWidth: 42, width: measure) == nil)
+        assert(accountMeterLabel(email: nil, maxWidth: 42, width: measure) == nil)
+        assert(accountEmailPrefix("john.doe@example.com") == "john.doe")
+        assert(accountEmailPrefix("@example.com") == "")
 
         let now = Date(timeIntervalSince1970: 1_000_000)
         // 5h window, 1h elapsed (20%), 10% used -> 10% in reserve, lasts until reset.

@@ -316,6 +316,11 @@ private enum StatusBarLogicTests {
         assert(!isNewerVersion("1.24.0-beta.3", than: "1.24.0"))
         assert(compareVersions("1.2", "1.2.0") == .orderedSame)
         assert(compareVersions("1.2.0+build5", "1.2.0") == .orderedSame)
+        // Server update checks scan the release list instead of trusting GitHub's ordering.
+        assert(newestVersionTag(["v1.24.0", "v1.25.0-beta.9", "v1.23.0"]) == "v1.25.0-beta.9")
+        assert(newestVersionTag(["v1.23.0", "v1.24.0"]) == "v1.24.0")
+        assert(newestVersionTag(["v1.25.0-beta.9", "v1.24.0"]) == "v1.25.0-beta.9")
+        assert(newestVersionTag([]) == nil)
 
         assert(isAppUpdateAsset("CodexLBStatusBar-0.3.1.dmg"))
         assert(!isAppUpdateAsset("CodexLBStatusBar-0.3.1.zip"))

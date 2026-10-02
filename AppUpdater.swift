@@ -39,6 +39,7 @@ final class AppUpdater {
         case noAsset
         case missingDigest
         case checksumMismatch
+        case noRelease(String)
         case notReplaceable(String)
         case invalidBundle(String)
         case command(String)
@@ -53,6 +54,8 @@ final class AppUpdater {
                 return "The release asset has no published SHA-256 digest, so it can't be verified."
             case .checksumMismatch:
                 return "The downloaded DMG doesn't match the published SHA-256 digest."
+            case .noRelease(let repo):
+                return "No releases found for \(repo)."
             case .notReplaceable(let reason):
                 return reason
             case .invalidBundle(let reason):
@@ -97,12 +100,25 @@ final class AppUpdater {
         return Update(version: version, release: release, asset: asset, sha256: sha256)
     }
 
-    /// Latest published (non-draft, non-prerelease) release tag of any public repo, e.g. "Soju06/codex-lb".
-    func latestReleaseTag(repo: String) async throws -> (tag: String, url: URL) {
-        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
+    /// Newest release tag for `repo`. `includePrereleases` scans the release list instead of
+    /// `/releases/latest`, which never returns a prerelease.
+    func latestReleaseTag(repo: String, includePrereleases: Bool = false) async throws -> (tag: String, url: URL) {
+        guard includePrereleases else {
+            guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
+                throw UpdateError.command("Invalid repository \(repo)")
+            }
+            let release: Release = try await fetchJSON(url)
+            return (release.tagName, release.htmlUrl)
+        }
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=30") else {
             throw UpdateError.command("Invalid repository \(repo)")
         }
-        let release: Release = try await fetchJSON(url)
+        let releases: [Release] = try await fetchJSON(url)
+        let published = releases.filter { !$0.draft }
+        guard let tag = newestVersionTag(published.map(\.tagName)),
+              let release = published.first(where: { $0.tagName == tag }) else {
+            throw UpdateError.noRelease(repo)
+        }
         return (release.tagName, release.htmlUrl)
     }
 

@@ -809,6 +809,17 @@ func isNewerVersion(_ candidate: String, than current: String) -> Bool {
     compareVersions(candidate, current) == .orderedDescending
 }
 
+/// Highest version among `tags` (prereleases included when they are passed in), so a release list
+/// can be scanned without trusting GitHub's ordering.
+func newestVersionTag(_ tags: [String]) -> String? {
+    tags.reduce(nil) { best, tag in
+        guard let best else {
+            return tag
+        }
+        return isNewerVersion(tag, than: best) ? tag : best
+    }
+}
+
 /// Release asset the updater installs: the versioned DMG produced by build-dmg.sh.
 func isAppUpdateAsset(_ name: String) -> Bool {
     name.hasPrefix("CodexLBStatusBar-") && name.hasSuffix(".dmg")

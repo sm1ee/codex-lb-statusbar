@@ -57,7 +57,7 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 - Average quota below 30% / 10%.
 - An account becomes re-auth-required or deactivated.
 - Unused reset credits expire within 24 hours.
-- A new Codex LB server release is available.
+- A new Codex LB server release is available (prereleases too, with `Betas` enabled in Settings).
 
 **App**
 - Refreshes every 60 seconds. When the server is unreachable, the last data stays visible, dimmed, with its age.
@@ -80,7 +80,7 @@ Guest sessions are read-only. Reset credits can't be used on paused, re-auth-req
 - **Pace** uses the average burn rate since the window started. The tick marks where remaining quota would be at an even pace.
 - **Quota alerts** fire once per threshold crossing and re-arm after the average recovers 5 points. Nothing is sent for the state seen at launch.
 - **Browser re-authentication** relies on the Codex LB server's `localhost:1455` OAuth callback. If the server runs on another machine, paste the final callback URL into the app or use device code.
-- **Server update checks** use the server's `/api/runtime/version`, and fall back to GitHub Releases on older servers.
+- **Server update checks** use the server's `/api/runtime/version`, and fall back to GitHub Releases on older servers (hourly; `Betas` in Settings also reports prereleases).
 
 ## Build
 

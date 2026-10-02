@@ -72,6 +72,7 @@ private final class SettingsStore {
     }
     private let skippedVersionKey = "codexLBSkippedAppVersion"
     private let notifiedServerVersionKey = "codexLBNotifiedServerVersion"
+    private let includePrereleasesKey = "codexLBIncludePrereleases"
 
     var autoCheckUpdates: Bool {
         get { defaults.object(forKey: autoUpdateKey) as? Bool ?? true }
@@ -87,6 +88,12 @@ private final class SettingsStore {
     var notifiedServerVersion: String? {
         get { defaults.string(forKey: notifiedServerVersionKey) }
         set { defaults.set(newValue, forKey: notifiedServerVersionKey) }
+    }
+
+    /// Server update checks may also report codex-lb prereleases (off by default).
+    var includePrereleases: Bool {
+        get { defaults.bool(forKey: includePrereleasesKey) }
+        set { defaults.set(newValue, forKey: includePrereleasesKey) }
     }
 
     var statusBarComponents: StatusBarComponents {
@@ -2285,6 +2292,7 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
     private let themePopup = NSPopUpButton()
     private let brightnessSlider = NSSlider(value: 0.5, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let serverVersionLabel = NSTextField(labelWithString: "Not checked yet")
+    private let includePrereleases = NSButton(checkboxWithTitle: "Betas", target: nil, action: nil)
 
     init(settings: SettingsStore, onChange: @escaping (SettingsChange) -> Void) {
         self.settings = settings
@@ -2354,6 +2362,7 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         forgetButton.isEnabled = hasSaved
         themePopup.selectItem(at: AppTheme.allCases.firstIndex(of: settings.theme) ?? 0)
         brightnessSlider.doubleValue = settings.brightness
+        includePrereleases.state = settings.includePrereleases ? .on : .off
     }
 
     func setServerStatus(_ text: String) {
@@ -2430,7 +2439,10 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         brightnessRow.spacing = 6
         serverVersionLabel.textColor = .secondaryLabelColor
         let checkServer = NSButton(title: "Check", target: self, action: #selector(checkServerVersion))
-        let serverVersionRow = NSStackView(views: [serverVersionLabel, checkServer])
+        includePrereleases.toolTip = "Also report prerelease builds of the codex-lb server, not just stable releases"
+        includePrereleases.target = self
+        includePrereleases.action = #selector(prereleasesChanged)
+        let serverVersionRow = NSStackView(views: [serverVersionLabel, includePrereleases, checkServer])
         serverVersionRow.spacing = 10
 
         let styleRow = NSStackView(views: [showUsageBar, showChart])
@@ -2610,6 +2622,12 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
 
     @objc private func checkServerVersion() {
         serverVersionLabel.stringValue = "Checking..."
+        onChange(.checkServerVersion)
+    }
+
+    @objc private func prereleasesChanged() {
+        settings.includePrereleases = includePrereleases.state == .on
+        // Re-check right away so the label shows what the new setting reports.
         onChange(.checkServerVersion)
     }
 }
@@ -4392,6 +4410,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             latest = release.tag
             serverReleaseURL = release.url
         }
+        // Opt-in: prereleases can be newer than the server's own idea of "latest".
+        if settings.includePrereleases,
+           let release = try? await updater.latestReleaseTag(repo: "Soju06/codex-lb", includePrereleases: true),
+           latest.map({ isNewerVersion(release.tag, than: $0) }) ?? true {
+            latest = release.tag
+            serverReleaseURL = release.url
+            source = "GitHub"
+        }
         guard let current else {
             settingsWindow?.setServerStatus("Server version unavailable")
             return
@@ -4403,7 +4429,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         rebuildMenu(updateVisiblePanel: isMenuOpen)
         let checked = DateFormatters.timeOnly.string(from: Date())
         if let newer {
-            settingsWindow?.setServerStatus("v\(current) · v\(newer) available (\(source), \(checked))")
+            let kind = newer.contains("-") ? "beta, " : ""
+            settingsWindow?.setServerStatus("v\(current) · v\(newer) available (\(kind)\(source), \(checked))")
             if settings.notifiedServerVersion != newer {
                 settings.notifiedServerVersion = newer
                 notifier.postServerUpdate(current: current, latest: newer)

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/statusbar-v0.3.1.png" width="420" alt="Codex LB Status Bar menu with three example accounts and a usage chart">
+  <img src="assets/statusbar-v0.4.1.png" width="400" alt="Codex LB Status Bar menu with three example accounts and a usage chart">
 </p>
 
 ## Install

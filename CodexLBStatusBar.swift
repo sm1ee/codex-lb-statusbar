@@ -101,12 +101,10 @@ private final class SettingsStore {
             if let raw = defaults.string(forKey: componentsKey) {
                 return StatusBarComponents(rawValue: raw)
             }
-            // Migrate the pre-0.4 style key: Meter -> usage, Text -> no usage bar.
+            // A stored pre-0.4 style key maps Meter -> usage bar, Text -> none. A fresh install has
+            // neither key and keeps the struct's defaults (usage bar on, chart off).
             let legacy = defaults.string(forKey: "codexLBStatusBarStyle")
-            let components = StatusBarComponents(
-                usage: legacy != nil && legacy != "text",
-                chart: false
-            )
+            let components = legacy.map { StatusBarComponents(usage: $0 != "text", chart: false) } ?? StatusBarComponents()
             defaults.set(components.rawValue, forKey: componentsKey)
             defaults.removeObject(forKey: "codexLBStatusBarStyle")
             defaults.removeObject(forKey: "codexLBStatusBarShowAccountCount")
@@ -685,7 +683,7 @@ private enum DateFormatters {
     static let timeOnly: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .none
-        formatter.timeStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
 }
@@ -2365,8 +2363,9 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         includePrereleases.state = settings.includePrereleases ? .on : .off
     }
 
-    func setServerStatus(_ text: String) {
+    func setServerStatus(_ text: String, toolTip: String? = nil) {
         serverVersionLabel.stringValue = text
+        serverVersionLabel.toolTip = toolTip
     }
 
     private func buildLayout() {
@@ -2438,6 +2437,11 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
         let brightnessRow = NSStackView(views: [dim, brightnessSlider, bright, resetBrightness])
         brightnessRow.spacing = 6
         serverVersionLabel.textColor = .secondaryLabelColor
+        // The status text carries versions and a timestamp, so let it truncate instead of widening
+        // the window when a long prerelease tag shows up.
+        serverVersionLabel.lineBreakMode = .byTruncatingTail
+        serverVersionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        serverVersionLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
         let checkServer = NSButton(title: "Check", target: self, action: #selector(checkServerVersion))
         includePrereleases.toolTip = "Also report prerelease builds of the codex-lb server, not just stable releases"
         includePrereleases.target = self
@@ -4427,18 +4431,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             ?? (serverRuntime?.updateAvailable == true ? normalizedLatest : nil)
         serverUpdateVersion = newer
         rebuildMenu(updateVisiblePanel: isMenuOpen)
+        // Short enough for the settings row: the label truncates rather than widening the window.
         let checked = DateFormatters.timeOnly.string(from: Date())
+        let sourceNote = source == "server" ? "the server's /api/runtime/version" : "GitHub Releases"
+        let toolTip = "Checked against \(sourceNote) at \(checked)."
         if let newer {
-            let kind = newer.contains("-") ? "beta, " : ""
-            settingsWindow?.setServerStatus("v\(current) · v\(newer) available (\(kind)\(source), \(checked))")
+            settingsWindow?.setServerStatus("v\(current) → v\(newer) · \(checked)", toolTip: toolTip)
             if settings.notifiedServerVersion != newer {
                 settings.notifiedServerVersion = newer
                 notifier.postServerUpdate(current: current, latest: newer)
             }
         } else if normalizedLatest != nil {
-            settingsWindow?.setServerStatus("v\(current) · up to date (\(source), \(checked))")
+            settingsWindow?.setServerStatus("v\(current) · up to date · \(checked)", toolTip: toolTip)
         } else {
-            settingsWindow?.setServerStatus("v\(current) · latest version unknown")
+            settingsWindow?.setServerStatus("v\(current) · latest version unknown", toolTip: toolTip)
         }
     }
 

@@ -67,6 +67,20 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 
 Guest sessions are read-only. Reset credits can't be used on paused, re-auth-required, or deactivated accounts (the same rule as the server).
 
+## Settings
+
+<p align="center">
+  <img src="assets/settings-v0.4.1.png" width="520" alt="Settings window with the default options">
+</p>
+
+A fresh install runs with:
+
+- **Server** `http://127.0.0.1:2455`, launch at login off, `⌥⌘L` opening the menu, quota and account notifications on, automatic update checks on, and codex-lb server checks against stable releases only (`Betas` also reports prereleases).
+- **Appearance** follows the system theme; the brightness slider controls how strongly the menu panel is tinted.
+- **Status bar** shows the usage bar with the sparkline off, drawn as `Combined` bars in `Warnings Only` colors for the 5h and Weekly windows, sorted worst first; the token chart uses the `Area` style.
+- **Menu** shows the usage summary for the last 7 days.
+- **Login** keeps the dashboard password in the macOS Keychain for the configured server.
+
 ## Security and privacy
 
 - The app talks only to your Codex LB server and to GitHub (`api.github.com` for update checks and release downloads).

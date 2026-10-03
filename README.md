@@ -41,7 +41,7 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 - Accounts can be ordered by usage (worst or best first), by name, or in server order.
 - The average counts rate-limited and quota-exceeded accounts (usually 0%) and leaves out paused, re-auth-required, and deactivated ones, so it doesn't jump when an account runs dry.
 - Colors: `Warnings Only` (default), `Full Color`, `Usage Only` (usage bar colored, text plain), or `Monochrome`. Each item can be hidden.
-- `⌥⌘L` opens the menu from anywhere.
+- `⌥⌘L` opens the menu from anywhere. With the per-account shapes, right-click an account's bar for its actions (dashboard, copy, rename, warm-up, reset credit) — a left click opens the menu as usual.
 
 **Accounts**
 - Status, routing policy, quota, reset timing, and pace per window (`On pace`, `N% in reserve`, `Runs out in …`), with an even-pace tick on each bar.

@@ -2716,11 +2716,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         notifier.configure()
         installEditMenu()
-        // Clicking one of the accounts meter's bars opens that account's action menu instead of
-        // the main menu. Menu tracking swallows mouseDown, so intercept from a local monitor.
+        // Left-clicking the item opens the menu with the account details, like the rest of it;
+        // right-clicking one of the accounts meter's bars opens that account's action menu (the same
+        // gesture the account cards use). Menu tracking swallows mouseDown, so intercept locally.
         statusClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self, let button = self.statusItem.button,
                   let window = event.window, window === button.window else {
+                return event
+            }
+            guard event.type == .rightMouseDown || event.modifierFlags.contains(.control) else {
                 return event
             }
             let point = button.convert(event.locationInWindow, from: nil)
@@ -3046,6 +3050,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
             if !perAccount.isEmpty {
                 tooltip.insert("Accounts: \(perAccount.map(\.1).joined(separator: " · "))", at: 1)
+                tooltip.append("Right-click an account's bar for its actions.")
             }
         }
         if summary.attentionCount > 0 {

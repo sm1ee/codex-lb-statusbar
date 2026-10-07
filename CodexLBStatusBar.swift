@@ -694,7 +694,10 @@ private enum VisualStyle {
     static let menuWidth: CGFloat = 400
     static let inset: CGFloat = 14
     static let contentWidth: CGFloat = menuWidth - inset * 2
+    /// Account card with one detail line per window; a window whose countdown and estimate cannot
+    /// share a row adds `accountCardDetailLineHeight`.
     static let accountCardHeight: CGFloat = 146
+    static let accountCardDetailLineHeight: CGFloat = 18
     static let cardRadius: CGFloat = 10
     static let cardPadding: CGFloat = 12
     static let sectionHeaderHeight: CGFloat = 30
@@ -1103,44 +1106,109 @@ private final class QuotaProgressView: NSView {
     }
 }
 
+/// One quota window on a card. The server reports a primary (5h), secondary (weekly), and monthly
+/// window; a card lays out at most two of them.
+private struct QuotaWindow {
+    let label: String
+    let remainingPercent: Double?
+    let resetAt: Date?
+    let windowMinutes: Int?
+}
+
+private func quotaWindows(for account: AccountSummary) -> [QuotaWindow] {
+    var windows: [QuotaWindow] = []
+    if account.windowMinutesPrimary != nil || account.usage?.primaryRemainingPercent != nil {
+        windows.append(QuotaWindow(label: "5h", remainingPercent: account.usage?.primaryRemainingPercent,
+                                   resetAt: account.resetAtPrimary, windowMinutes: account.windowMinutesPrimary))
+    }
+    if account.windowMinutesSecondary != nil || account.usage?.secondaryRemainingPercent != nil {
+        windows.append(QuotaWindow(label: "Weekly", remainingPercent: account.usage?.secondaryRemainingPercent,
+                                   resetAt: account.resetAtSecondary, windowMinutes: account.windowMinutesSecondary))
+    }
+    if account.windowMinutesMonthly != nil || account.usage?.monthlyRemainingPercent != nil {
+        windows.append(QuotaWindow(label: "Monthly", remainingPercent: account.usage?.monthlyRemainingPercent,
+                                   resetAt: account.resetAtMonthly, windowMinutes: account.windowMinutesMonthly))
+    }
+    return Array(windows.prefix(2))
+}
+
+private func windowPace(_ window: QuotaWindow) -> QuotaPace? {
+    window.remainingPercent.flatMap {
+        quotaPace(remainingPercent: $0, resetAt: window.resetAt, windowMinutes: window.windowMinutes)
+    }
+}
+
+private func quotaResetText(_ resetAt: Date?) -> String {
+    resetAt.map { "Resets in \(relativeTime($0))" } ?? "No reset time"
+}
+
+/// Right side of a window's detail row: the runway when the quota will not last, otherwise the pace.
+private func quotaPacePresentation(_ pace: QuotaPace?) -> (text: String, color: NSColor, emphasized: Bool) {
+    if let pace, pace.exhausted {
+        return ("Empty until reset", VisualStyle.red, true)
+    }
+    if let pace, pace.runsOutIn != nil {
+        return (pace.runwayLabel, VisualStyle.amber, true)
+    }
+    return (pace?.paceLabel ?? "", VisualStyle.textMuted, false)
+}
+
+/// Whether the countdown and the estimate share one row in a column this wide. Measured with the
+/// fonts the labels use plus a little slack, so a "fits" answer never ends up truncated.
+private func quotaDetailFitsOneLine(resetText: String, paceText: String, paceEmphasized: Bool, columnWidth: CGFloat) -> Bool {
+    guard !paceText.isEmpty else {
+        return true
+    }
+    let resetWidth = (resetText as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+    let paceFont = NSFont.systemFont(ofSize: 11, weight: paceEmphasized ? .medium : .regular)
+    let paceWidth = (paceText as NSString).size(withAttributes: [.font: paceFont]).width
+    return resetWidth + quotaDetailRowSpacing + paceWidth + 4 <= columnWidth
+}
+
+/// Gap between the countdown and the estimate while they share a row, and inside a split line.
+private let quotaDetailRowSpacing: CGFloat = 6
+
 private final class QuotaMiniView: NSView {
-    init(label: String, remainingPercent: Double?, resetAt: Date?, windowMinutes: Int?) {
+    init(window: QuotaWindow, twoDetailLines: Bool) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        let pace = remainingPercent.flatMap { quotaPace(remainingPercent: $0, resetAt: resetAt, windowMinutes: windowMinutes) }
-        let name = makeLabel(label, size: 12, weight: .medium, color: VisualStyle.textSecondary)
-        let percent = makeLabel(formatOptionalPercent(remainingPercent), size: 12, weight: .semibold, color: VisualStyle.textPrimary)
+        let pace = windowPace(window)
+        let name = makeLabel(window.label, size: 12, weight: .medium, color: VisualStyle.textSecondary)
+        let percent = makeLabel(formatOptionalPercent(window.remainingPercent), size: 12, weight: .semibold, color: VisualStyle.textPrimary)
         percent.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         let topRow = Self.row(name, percent)
 
-        let progress = QuotaProgressView(percent: remainingPercent, paceMarker: pace?.expectedRemainingPercent)
-        let resetText = resetAt.map { "Resets in \(relativeTime($0))" } ?? "No reset time"
+        let progress = QuotaProgressView(percent: window.remainingPercent, paceMarker: pace?.expectedRemainingPercent)
+        let resetText = quotaResetText(window.resetAt)
         let reset = makeLabel(resetText, size: 11, color: VisualStyle.textMuted)
-        // Right side: the one thing worth knowing. Runway when it won't last, otherwise the pace.
-        let paceText: String
-        var paceColor = VisualStyle.textMuted
-        if let pace, pace.exhausted {
-            paceText = "Empty until reset"
-            paceColor = VisualStyle.red
-        } else if let pace, pace.runsOutIn != nil {
-            paceText = pace.runwayLabel
-            paceColor = VisualStyle.amber
+        let presentation = quotaPacePresentation(pace)
+        let paceLabel = makeLabel(presentation.text, size: 11,
+                                  weight: presentation.emphasized ? .medium : .regular,
+                                  color: presentation.color)
+        let detailViews: [NSView]
+        if twoDetailLines, !presentation.text.isEmpty {
+            // Neither value keeps its reading if they share a row, so each gets a full-width line.
+            detailViews = [Self.line(reset, trailing: false), Self.line(paceLabel, trailing: true)]
         } else {
-            paceText = pace?.paceLabel ?? ""
+            detailViews = [Self.row(reset, paceLabel)]
         }
-        let paceLabel = makeLabel(paceText, size: 11, weight: paceColor == VisualStyle.textMuted ? .regular : .medium, color: paceColor)
-        let detailRow = Self.row(reset, paceLabel)
 
-        let stack = NSStackView(views: [topRow, progress, detailRow])
+        let stack = NSStackView(views: [topRow, progress] + detailViews)
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 4
+        if detailViews.count > 1 {
+            stack.setCustomSpacing(2, after: detailViews[0])
+        }
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        var tooltip = [resetText]
         if let pace {
-            toolTip = "\(pace.paceLabel) · \(pace.runwayLabel)\nThe tick marks where remaining quota would be at an even pace."
+            tooltip.append("\(pace.paceLabel) · \(pace.runwayLabel)")
+            tooltip.append("The tick marks where remaining quota would be at an even pace.")
         }
+        toolTip = tooltip.joined(separator: "\n")
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -1149,8 +1217,21 @@ private final class QuotaMiniView: NSView {
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
             topRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             progress.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            detailRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-        ])
+        ] + detailViews.map { $0.widthAnchor.constraint(equalTo: stack.widthAnchor) })
+    }
+
+    /// One full-width detail line: the countdown hugs the leading edge, the estimate the trailing one.
+    private static func line(_ label: NSTextField, trailing: Bool) -> NSStackView {
+        label.alignment = trailing ? .right : .left
+        label.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        let spacer = NSView.spacer()
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: trailing ? [spacer, label] : [label, spacer])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = quotaDetailRowSpacing
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
     }
 
     private static func row(_ left: NSTextField, _ right: NSTextField) -> NSStackView {
@@ -1160,7 +1241,7 @@ private final class QuotaMiniView: NSView {
         let row = NSStackView(views: [left, NSView.spacer(), right])
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 6
+        row.spacing = quotaDetailRowSpacing
         row.translatesAutoresizingMaskIntoConstraints = false
         return row
     }
@@ -1174,6 +1255,8 @@ private final class QuotaMiniView: NSView {
 private final class AccountCardView: NSView {
     private let accountId: String
     private let contextMenuProvider: (String) -> NSMenu?
+    /// One detail line per window, or two when a window cannot fit its countdown and estimate on one.
+    let cardHeight: CGFloat
 
     /// Right-click (or Control-click) anywhere on the card opens the account actions menu.
     override func rightMouseDown(with event: NSEvent) {
@@ -1208,9 +1291,28 @@ private final class AccountCardView: NSView {
         resetAction: Selector,
         contextMenuProvider: @escaping (String) -> NSMenu?
     ) {
+        let windows = quotaWindows(for: account)
+        let columnSpacing: CGFloat = 16
+        let columnWidth = windows.isEmpty
+            ? VisualStyle.contentWidth - VisualStyle.cardPadding * 2
+            : (VisualStyle.contentWidth - VisualStyle.cardPadding * 2 - columnSpacing * CGFloat(windows.count - 1)) / CGFloat(windows.count)
+        // Cards are as short as they can be: the second detail line only appears when a window's
+        // countdown and estimate are too wide to share a row in a column this size.
+        let twoDetailLines = windows.contains { window in
+            let presentation = quotaPacePresentation(windowPace(window))
+            return !quotaDetailFitsOneLine(
+                resetText: quotaResetText(window.resetAt),
+                paceText: presentation.text,
+                paceEmphasized: presentation.emphasized,
+                columnWidth: columnWidth
+            )
+        }
+        self.cardHeight = twoDetailLines
+            ? VisualStyle.accountCardHeight + VisualStyle.accountCardDetailLineHeight
+            : VisualStyle.accountCardHeight
         self.accountId = account.accountId
         self.contextMenuProvider = contextMenuProvider
-        super.init(frame: NSRect(x: 0, y: 0, width: VisualStyle.contentWidth, height: VisualStyle.accountCardHeight))
+        super.init(frame: NSRect(x: 0, y: 0, width: VisualStyle.contentWidth, height: cardHeight))
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = VisualStyle.cardBackground.resolvedCG
@@ -1348,16 +1450,15 @@ private final class AccountCardView: NSView {
         quotaRow.orientation = .horizontal
         quotaRow.alignment = .top
         quotaRow.distribution = .fillEqually
-        quotaRow.spacing = 16
+        quotaRow.spacing = columnSpacing
         quotaRow.translatesAutoresizingMaskIntoConstraints = false
         addSubview(quotaRow)
 
-        let quotaViews = quotaViewsForAccount(account)
-        if quotaViews.isEmpty {
+        if windows.isEmpty {
             quotaRow.addArrangedSubview(makeLabel("Quota unavailable", size: 12, color: VisualStyle.textMuted))
         } else {
-            for view in quotaViews.prefix(2) {
-                quotaRow.addArrangedSubview(view)
+            for window in windows {
+                quotaRow.addArrangedSubview(QuotaMiniView(window: window, twoDetailLines: twoDetailLines))
             }
         }
 
@@ -1386,7 +1487,7 @@ private final class AccountCardView: NSView {
         let pad = VisualStyle.cardPadding
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: VisualStyle.contentWidth),
-            heightAnchor.constraint(equalToConstant: VisualStyle.accountCardHeight),
+            heightAnchor.constraint(equalToConstant: cardHeight),
             topRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad),
             topRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -pad),
             topRow.topAnchor.constraint(equalTo: topAnchor, constant: pad),
@@ -1433,18 +1534,33 @@ private final class AccountsPanelView: RoundedPanelView {
         let isOffline = offlineSince != nil
         let byId = Dictionary(accounts.map { ($0.accountId, $0) }, uniquingKeysWith: { first, _ in first })
         let visible = orderedAccountIDs(accounts.map(accountSortKey), sort: sort, filter: filter).compactMap { byId[$0] }
-        let cardHeight = VisualStyle.accountCardHeight
+        // Cards decide their own height (a window that cannot fit its detail on one row adds a line),
+        // so the panel is sized from them instead of a single constant.
+        let cards = visible.map { account in
+            AccountCardView(
+                account: account,
+                canWrite: canWrite && !isOffline,
+                isRefreshing: isRefreshing,
+                mutation: accountMutations[account.accountId],
+                actionTarget: accountActionTarget,
+                statusAction: statusAction,
+                routingAction: routingAction,
+                resetAction: resetAction,
+                contextMenuProvider: contextMenuProvider
+            )
+        }
+        let cardHeights = cards.map(\.cardHeight)
         let emptyHeight: CGFloat = 56
         let gap: CGFloat = 8
         let headerHeight: CGFloat = 30
-        let maxCardsVisible: CGFloat = 4
+        let maxCardsVisible = 4
         // Header: 10 top + 20 row + 6 gap; scroll area ends 10 above the bottom. Must match the constraints
         // below exactly, or the stack overflows by a few points and the scroll view starts scrolled.
         let chrome = headerHeight + 6 + 4
-        let contentHeight = visible.isEmpty
+        let contentHeight = cards.isEmpty
             ? chrome + emptyHeight
-            : chrome + CGFloat(visible.count) * cardHeight + CGFloat(max(visible.count - 1, 0)) * gap
-        let maxHeight = chrome + maxCardsVisible * cardHeight + (maxCardsVisible - 1) * gap
+            : chrome + cardHeights.reduce(0, +) + CGFloat(max(cards.count - 1, 0)) * gap
+        let maxHeight = chrome + cardHeights.prefix(maxCardsVisible).reduce(0, +) + CGFloat(maxCardsVisible - 1) * gap
         let height = min(contentHeight, maxHeight)
         super.init(width: VisualStyle.menuWidth, height: height)
 
@@ -1524,18 +1640,8 @@ private final class AccountsPanelView: RoundedPanelView {
             ])
             stack.addArrangedSubview(box)
         }
-        for account in visible {
-            stack.addArrangedSubview(AccountCardView(
-                account: account,
-                canWrite: canWrite && !isOffline,
-                isRefreshing: isRefreshing,
-                mutation: accountMutations[account.accountId],
-                actionTarget: accountActionTarget,
-                statusAction: statusAction,
-                routingAction: routingAction,
-                resetAction: resetAction,
-                contextMenuProvider: contextMenuProvider
-            ))
+        for card in cards {
+            stack.addArrangedSubview(card)
         }
 
         let scrollView = NSScrollView()
@@ -2021,23 +2127,6 @@ private func accountSort(_ lhs: AccountSummary, _ rhs: AccountSummary) -> Bool {
         return false
     }
     return accountTitle(lhs).localizedCaseInsensitiveCompare(accountTitle(rhs)) == .orderedAscending
-}
-
-private func quotaViewsForAccount(_ account: AccountSummary) -> [NSView] {
-    var rows: [NSView] = []
-    if account.windowMinutesPrimary != nil || account.usage?.primaryRemainingPercent != nil {
-        rows.append(QuotaMiniView(label: "5h", remainingPercent: account.usage?.primaryRemainingPercent,
-                                  resetAt: account.resetAtPrimary, windowMinutes: account.windowMinutesPrimary))
-    }
-    if account.windowMinutesSecondary != nil || account.usage?.secondaryRemainingPercent != nil {
-        rows.append(QuotaMiniView(label: "Weekly", remainingPercent: account.usage?.secondaryRemainingPercent,
-                                  resetAt: account.resetAtSecondary, windowMinutes: account.windowMinutesSecondary))
-    }
-    if account.windowMinutesMonthly != nil || account.usage?.monthlyRemainingPercent != nil {
-        rows.append(QuotaMiniView(label: "Monthly", remainingPercent: account.usage?.monthlyRemainingPercent,
-                                  resetAt: account.resetAtMonthly, windowMinutes: account.windowMinutesMonthly))
-    }
-    return rows
 }
 
 private func warmupStatus(_ account: AccountSummary) -> String {

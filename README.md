@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/statusbar-v0.4.1.png" width="400" alt="Codex LB Status Bar menu with three example accounts and a usage chart">
+  <img src="assets/statusbar-v0.4.3.png" width="400" alt="Codex LB Status Bar menu with example accounts, each showing its reset countdown and depletion estimate, and a usage chart">
 </p>
 
 ## Install
@@ -44,7 +44,7 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 - `⌥⌘L` opens the menu from anywhere. With the per-account shapes, right-click an account's bar for its actions (dashboard, copy, rename, warm-up, reset credit) — a left click opens the menu as usual.
 
 **Accounts**
-- Status, routing policy, quota, reset timing, and pace per window (`On pace`, `N% in reserve`, `Runs out in …`), with an even-pace tick on each bar.
+- Status, routing policy, quota, reset timing, and pace per window (`On pace`, `N% in reserve`, `Runs out in …`), with an even-pace tick on each bar. The estimate drops to its own line when it cannot share the row with the reset countdown.
 - Sort by status, remaining quota, soonest reset, or name, or show only accounts that need attention.
 - Admin controls: pause/resume, cycle routing policy, and use a reset credit (with a confirmation showing which credit is used).
 - Re-authenticate expired accounts from the status badge via browser OAuth (paste the callback URL for remote servers) or device code.

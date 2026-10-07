@@ -60,9 +60,9 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 - A new Codex LB server release is available (prereleases too, with `Betas` enabled in Settings).
 
 **App**
-- Refreshes every 60 seconds. When the server is unreachable, the last data stays visible, dimmed, with its age.
+- Refreshes every 30 seconds. When the server is unreachable, the last data stays visible, dimmed, with its age.
 - Theme follows the system or is forced to Light/Dark, with a brightness slider.
-- Self-updates from GitHub Releases, and checks the connected Codex LB server for updates.
+- Self-updates from GitHub Releases — with a size/percent progress bar while the DMG downloads — and checks the connected Codex LB server for updates.
 - Remembers the dashboard login in the macOS Keychain per server.
 
 Guest sessions are read-only. Reset credits can't be used on paused, re-auth-required, or deactivated accounts (the same rule as the server).

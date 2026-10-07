@@ -7,6 +7,7 @@ private enum StatusBarLogicTests {
         displayAndPaceTests()
         versionTests()
         accountListTests()
+        numericSafetyTests()
         assert(sessionMenuLabel(authenticated: false, role: "admin") == nil)
         assert(sessionMenuLabel(authenticated: true, role: "admin") == "Signed in as Admin")
         assert(sessionMenuLabel(authenticated: true, role: "guest") == "Signed in as Guest")
@@ -368,5 +369,29 @@ private enum StatusBarLogicTests {
         assert(staleDataLabel(lastSuccess: nil, now: now) == "Offline")
         assert(staleDataLabel(lastSuccess: now.addingTimeInterval(-10), now: now) == "Offline · data from just now")
         assert(staleDataLabel(lastSuccess: now.addingTimeInterval(-300), now: now) == "Offline · data from 5m ago")
+    }
+
+    /// Server numbers are untrusted: display conversions clamp instead of trapping, and the rounded
+    /// percent drives both the label and the tone so "70%" is never drawn as amber.
+    static func numericSafetyTests() {
+        assert(percentInt(69.6) == 70)
+        assert(percentInt(0) == 0)
+        assert(percentInt(100.4) == 100)
+        assert(percentInt(-7) == 0)
+        assert(percentInt(1e20) == 100)
+        assert(percentInt(.nan) == 0)
+        assert(percentInt(.infinity) == 0)
+
+        assert(formatCompactCount(999) == "999")
+        assert(formatCompactCount(1_260_000) == "1.3M")
+        assert(formatCompactCount(5_900_000_000) == "5.9B")
+        assert(formatCompactCount(999_950) == "1M")             // used to read "1000K"
+        assert(formatCompactCount(999_999_999_999) == "1T")
+        assert(formatCompactCount(.infinity) == "--")
+
+        let segments = statusTitleSegments(primary: 69.6, secondary: 29.6, monthly: nil, activeCount: 1, totalCount: 2, attentionCount: 0)
+        assert(segments.map(\.text) == ["5h 70%", "W 30%", "(1/2)"])
+        assert(segments[0].kind == .quota(.green))
+        assert(segments[1].kind == .quota(.amber))
     }
 }

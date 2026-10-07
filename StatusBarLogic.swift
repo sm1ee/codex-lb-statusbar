@@ -83,6 +83,16 @@ func quotaTone(for percent: Double) -> QuotaTone {
     return .red
 }
 
+/// Whole percent for display. Percentages come from the server and `Int(round(1e20))` traps, so the
+/// value is clamped to the range the bars already draw before converting — a bogus number can then
+/// never take the app down, and the text matches the bar and the tone.
+func percentInt(_ value: Double) -> Int {
+    guard value.isFinite else {
+        return 0
+    }
+    return Int(min(max(value.rounded(), 0), 100))
+}
+
 func compactResetCreditLabel(count: Int, expiresAt: Date?, now: Date = Date()) -> String? {
     guard count > 0 else {
         return nil
@@ -201,7 +211,8 @@ func statusTitleSegments(
         segments.append(StatusTitleSegment(text: "!", kind: .attention))
     }
     func quota(_ label: String, _ value: Double) {
-        segments.append(StatusTitleSegment(text: "\(label) \(Int(round(value)))%", kind: .quota(quotaTone(for: value))))
+        let percent = percentInt(value)
+        segments.append(StatusTitleSegment(text: "\(label) \(percent)%", kind: .quota(quotaTone(for: Double(percent)))))
     }
     if let primary {
         quota("5h", primary)
@@ -738,14 +749,27 @@ func resetCreditSummaryText(count: Int, expiresAt: Date?, now: Date = Date()) ->
 }
 
 func formatCompactCount(_ value: Double) -> String {
-    let magnitude = abs(value)
-    let units: [(Double, String)] = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]
-    for (threshold, suffix) in units where magnitude >= threshold {
-        let scaled = value / threshold
-        let text = scaled >= 100 ? String(format: "%.0f", scaled) : String(format: "%.1f", scaled)
-        return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + suffix
+    guard value.isFinite else {
+        return "--"
     }
-    return String(Int(round(value)))
+    let units: [(threshold: Double, suffix: String)] = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]
+    var index = units.firstIndex { abs(value) >= $0.threshold }
+    // Rounding can push a value into the next unit: 999,950 must read "1M", not "1000K".
+    while let current = index, current > 0 {
+        let scaled = value / units[current].threshold
+        let rounded = abs(scaled) >= 100 ? scaled.rounded() : (scaled * 10).rounded() / 10
+        if abs(rounded) >= 1000 {
+            index = current - 1
+            continue
+        }
+        break
+    }
+    guard let unit = index else {
+        return String(Int(min(max(value.rounded(), -1e15), 1e15)))
+    }
+    let scaled = value / units[unit].threshold
+    let text = abs(scaled) >= 100 ? String(format: "%.0f", scaled) : String(format: "%.1f", scaled)
+    return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + units[unit].suffix
 }
 
 func formatUSD(_ value: Double) -> String {

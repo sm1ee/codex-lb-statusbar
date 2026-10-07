@@ -34,6 +34,14 @@ final class AppUpdater {
         let sha256: String
     }
 
+    /// One line of installer progress: the message, the download fraction while bytes are moving
+    /// (nil for phases without byte counts), and the received/total detail line.
+    struct Progress {
+        let message: String
+        let fraction: Double?
+        let detail: String?
+    }
+
     enum UpdateError: LocalizedError {
         case http(Int)
         case noAsset
@@ -137,23 +145,36 @@ final class AppUpdater {
 
     /// Downloads, verifies, and stages the update, then hands off to a helper that swaps the bundle
     /// after this process exits and relaunches the new version. Terminates the app on success.
-    func install(_ update: Update, progress: @escaping (String) -> Void) async throws {
+    func install(_ update: Update, progress: @escaping (Progress) -> Void) async throws {
         if let blocker = installBlocker() {
             throw UpdateError.notReplaceable(blocker)
         }
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-lb-statusbar-update-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-
-        progress("Downloading \(update.asset.name)...")
-        let (downloaded, response) = try await session.download(from: update.asset.browserDownloadUrl)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw UpdateError.http(http.statusCode)
+        // Failed installs used to leave the DMG and the staged app behind; the swap helper takes
+        // ownership of the folder once it is launched, so only clean up before that.
+        var handedOffToHelper = false
+        defer {
+            if !handedOffToHelper {
+                try? FileManager.default.removeItem(at: work)
+            }
         }
-        let dmg = work.appendingPathComponent(update.asset.name)
+
+        let assetName = update.asset.name
+        let totalBytes = Int64(update.asset.size)
+        progress(Progress(message: "Downloading \(assetName)...", fraction: totalBytes > 0 ? 0 : nil, detail: nil))
+        let downloaded = try await downloadAsset(from: update.asset.browserDownloadUrl, expectedBytes: totalBytes, into: work) { fraction in
+            let received = Int64(Double(totalBytes) * fraction)
+            let detail = totalBytes > 0
+                ? "\(Int(fraction * 100))% · \(Self.byteText(received)) of \(Self.byteText(totalBytes))"
+                : nil
+            progress(Progress(message: "Downloading \(assetName)...", fraction: fraction, detail: detail))
+        }
+        let dmg = work.appendingPathComponent(assetName)
         try FileManager.default.moveItem(at: downloaded, to: dmg)
 
-        progress("Verifying download...")
+        progress(Progress(message: "Verifying download...", fraction: nil, detail: nil))
         let digest = try await Task.detached {
             SHA256.hash(data: try Data(contentsOf: dmg, options: .mappedIfSafe))
                 .map { String(format: "%02x", $0) }.joined()
@@ -162,7 +183,7 @@ final class AppUpdater {
             throw UpdateError.checksumMismatch
         }
 
-        progress("Preparing update...")
+        progress(Progress(message: "Preparing update...", fraction: nil, detail: nil))
         let mountPoint = work.appendingPathComponent("mnt", isDirectory: true)
         try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
         try await run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mountPoint.path])
@@ -186,9 +207,40 @@ final class AppUpdater {
             throw UpdateError.invalidBundle("code signature is invalid")
         }
 
-        progress("Installing and relaunching...")
+        progress(Progress(message: "Installing and relaunching...", fraction: nil, detail: nil))
         try launchSwapHelper(staged: staged, workDir: work)
+        handedOffToHelper = true
         NSApp.terminate(nil)
+    }
+
+    /// Streams one asset into `directory` and reports byte progress (0...1). `download(from:)` hides
+    /// progress, so the transfer runs through a task with a delegate that counts bytes.
+    private func downloadAsset(from url: URL, expectedBytes: Int64, into directory: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
+        let delegate = AssetDownloadDelegate(expectedBytes: expectedBytes, destination: directory) { fraction in
+            Task { @MainActor in
+                onProgress(fraction)
+            }
+        }
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        return try await withCheckedThrowingContinuation { continuation in
+            delegate.completion = { result in
+                switch result {
+                case .success(let staged):
+                    continuation.resume(returning: staged)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    private static func byteText(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(bytes, 0))
     }
 
     private func verifyBundle(at url: URL, expectedVersion: String) throws {
@@ -211,11 +263,15 @@ final class AppUpdater {
         pid="$1"; target="$2"; staged="$3"; work="$4"
         for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
         backup="$work/previous.app"
-        if mv "$target" "$backup" && /usr/bin/ditto "$staged" "$target"; then
-          /usr/bin/xattr -dr com.apple.quarantine "$target" 2>/dev/null
-          rm -rf "$backup"
-        else
-          rm -rf "$target"; mv "$backup" "$target"
+        # Roll back only once the backup exists: if moving the installed app failed (cross-volume
+        # copy), deleting "$target" would remove the only copy of the app.
+        if mv "$target" "$backup"; then
+          if /usr/bin/ditto "$staged" "$target"; then
+            /usr/bin/xattr -dr com.apple.quarantine "$target" 2>/dev/null
+            rm -rf "$backup"
+          else
+            rm -rf "$target"; mv "$backup" "$target"
+          fi
         fi
         /usr/bin/open "$target"
         rm -rf "$work"
@@ -259,15 +315,96 @@ final class AppUpdater {
     }
 }
 
+/// Byte progress for one asset download. The temporary file handed to `didFinishDownloadingTo` is
+/// only valid inside that callback, so it moves into the update's work directory right away.
+private final class AssetDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    var completion: ((Result<URL, Error>) -> Void)?
+
+    private let expectedBytes: Int64
+    private let destination: URL
+    private let onProgress: (Double) -> Void
+    private var staged: URL?
+    private var finished = false
+    private var lastReported = Date.distantPast
+
+    init(expectedBytes: Int64, destination: URL, onProgress: @escaping (Double) -> Void) {
+        self.expectedBytes = expectedBytes
+        self.destination = destination
+        self.onProgress = onProgress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        // GitHub serves a Content-Length; the release metadata covers a response that doesn't.
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
+        guard total > 0 else {
+            return
+        }
+        let fraction = min(Double(totalBytesWritten) / Double(total), 1)
+        let now = Date()
+        guard fraction >= 1 || now.timeIntervalSince(lastReported) >= 0.2 else {
+            return
+        }
+        lastReported = now
+        onProgress(fraction)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        let target = destination.appendingPathComponent(UUID().uuidString)
+        do {
+            try FileManager.default.moveItem(at: location, to: target)
+            staged = target
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            finish(.failure(error))
+            return
+        }
+        if let http = task.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if let staged {
+                try? FileManager.default.removeItem(at: staged)
+            }
+            finish(.failure(AppUpdater.UpdateError.http(http.statusCode)))
+            return
+        }
+        guard let staged else {
+            finish(.failure(AppUpdater.UpdateError.command("The download finished without a file.")))
+            return
+        }
+        finish(.success(staged))
+    }
+
+    private func finish(_ result: Result<URL, Error>) {
+        guard !finished else {
+            return
+        }
+        finished = true
+        completion?(result)
+    }
+}
+
 /// Small floating window that shows installer progress (the menu can't stay open during a download).
+/// The bar is determinate while bytes are arriving and reverts to the spinning bar for the phases
+/// that have nothing to measure.
 @MainActor
 final class UpdateProgressWindow {
     private let window: NSPanel
     private let label: NSTextField
+    private let detail: NSTextField
+    private let indicator: NSProgressIndicator
 
     init(title: String) {
         window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 96),
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 104),
             styleMask: [.titled, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -277,21 +414,33 @@ final class UpdateProgressWindow {
         window.level = .floating
         label = NSTextField(labelWithString: "Starting...")
         label.translatesAutoresizingMaskIntoConstraints = false
-        let indicator = NSProgressIndicator()
+        label.lineBreakMode = .byTruncatingTail
+        detail = NSTextField(labelWithString: "")
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        detail.lineBreakMode = .byTruncatingTail
+        indicator = NSProgressIndicator()
         indicator.style = .bar
         indicator.isIndeterminate = true
+        indicator.usesThreadedAnimation = false
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.startAnimation(nil)
         let content = NSView()
         content.addSubview(label)
+        content.addSubview(detail)
         content.addSubview(indicator)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             label.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             label.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            detail.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            detail.trailingAnchor.constraint(equalTo: label.trailingAnchor),
+            detail.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 4),
             indicator.leadingAnchor.constraint(equalTo: label.leadingAnchor),
             indicator.trailingAnchor.constraint(equalTo: label.trailingAnchor),
-            indicator.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 12),
+            indicator.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 12),
+            indicator.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
         ])
         window.contentView = content
     }
@@ -302,8 +451,22 @@ final class UpdateProgressWindow {
         window.makeKeyAndOrderFront(nil)
     }
 
-    func update(_ message: String) {
+    func update(_ message: String, fraction: Double?, detail detailText: String?) {
         label.stringValue = message
+        detail.stringValue = detailText ?? ""
+        if let fraction {
+            if indicator.isIndeterminate {
+                indicator.stopAnimation(nil)
+                indicator.isIndeterminate = false
+                indicator.minValue = 0
+                indicator.maxValue = 1
+            }
+            indicator.doubleValue = min(max(fraction, 0), 1)
+        } else if !indicator.isIndeterminate {
+            indicator.isIndeterminate = true
+            indicator.doubleValue = 0
+            indicator.startAnimation(nil)
+        }
     }
 
     func close() {

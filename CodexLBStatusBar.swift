@@ -1026,7 +1026,7 @@ private enum AccountMeterMetrics {
     /// a fixed reserve that looks like a wide gap next to short percents.
     static func cellWidths(values: [Double?]) -> [CGFloat] {
         values.map { value in
-            let percent = value.map { "\(Int(round($0)))%" } ?? ""
+            let percent = value.map(formatPercent) ?? ""
             let width = (percent as NSString).size(withAttributes: [.font: percentFont]).width
             // Whole-point cells: a fractional width pushes every following bar and percent onto a
             // half pixel, which the 1x menu bar renders as a soft edge.
@@ -1560,8 +1560,12 @@ private final class AccountsPanelView: RoundedPanelView {
         let contentHeight = cards.isEmpty
             ? chrome + emptyHeight
             : chrome + cardHeights.reduce(0, +) + CGFloat(max(cards.count - 1, 0)) * gap
-        let maxHeight = chrome + cardHeights.prefix(maxCardsVisible).reduce(0, +) + CGFloat(maxCardsVisible - 1) * gap
-        let height = min(contentHeight, maxHeight)
+        // The four-card scroll cap applies to the list only: an empty result ("all accounts look
+        // healthy") still needs its full message height, or the text is clipped behind a scroller.
+        let cardCapHeight = cards.isEmpty
+            ? contentHeight
+            : chrome + cardHeights.prefix(maxCardsVisible).reduce(0, +) + CGFloat(maxCardsVisible - 1) * gap
+        let height = min(contentHeight, cardCapHeight)
         super.init(width: VisualStyle.menuWidth, height: height)
 
         let refreshControl: NSView
@@ -1648,7 +1652,7 @@ private final class AccountsPanelView: RoundedPanelView {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = contentHeight > maxHeight
+        scrollView.hasVerticalScroller = contentHeight > cardCapHeight
         scrollView.autohidesScrollers = true
         let document = FlippedView()
         document.translatesAutoresizingMaskIntoConstraints = false
@@ -1733,11 +1737,14 @@ private final class UsageChartView: NSView {
 
     private func drawBars() {
         let peak = max(values.max() ?? 0, 1)
-        let gap: CGFloat = values.count > 40 ? 1.5 : 3
-        let barWidth = max(1.5, (bounds.width - gap * CGFloat(values.count - 1)) / CGFloat(values.count))
+        // Pitch comes from the width so a fine-grained series (hourly points for a week) still ends
+        // inside the chart: a fixed bar+gap used to draw the newest bars past the right edge.
+        let pitch = bounds.width / CGFloat(values.count)
+        let gap = min(pitch * 0.3, values.count > 40 ? 1.5 : 3)
+        let barWidth = max(0.75, pitch - gap)
         let radius = min(2, barWidth / 2)
         for (index, value) in values.enumerated() {
-            let x = CGFloat(index) * (barWidth + gap)
+            let x = CGFloat(index) * pitch
             if value <= 0 {
                 VisualStyle.trackDim.setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: 0, width: barWidth, height: 2), xRadius: 1, yRadius: 1).fill()
@@ -2238,7 +2245,7 @@ private final class StatusNotifier: NSObject, UNUserNotificationCenterDelegate {
             post(
                 id: "quota-\(alert.label)",
                 title: "\(alert.label) quota below \(Int(alert.threshold))%",
-                body: "Average remaining is \(Int(round(alert.value)))% across \(summary.countedCount) usable account(s)."
+                body: "Average remaining is \(String(format: "%.1f", alert.value))% across \(summary.countedCount) usable account(s)."
             )
         }
         for accountId in reauthIds {
@@ -2682,7 +2689,7 @@ private final class SettingsWindowController: NSObject, NSWindowDelegate, NSText
     @objc private func menuContentChanged() {
         settings.showUsageSummary = showUsage.state == .on
         periodPopup.isEnabled = settings.showUsageSummary
-        chartPopup.isEnabled = settings.showUsageSummary
+        chartPopup.isEnabled = settings.showUsageSummary || showChart.state == .on
         onChange(.menuContent(periodChanged: false))
     }
 
@@ -2775,6 +2782,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// doesn't hit the server's login rate limiter on every refresh.
     private var autoLoginAttemptedForURL: String?
     private var savedLoginError: String?
+    /// Bumped whenever the client is replaced (server URL change): a refresh that started against the
+    /// old server must not write its results into state that now belongs to the new one.
+    private var refreshGeneration = 0
     private let updater = AppUpdater()
     private var appearanceObservation: NSKeyValueObservation?
     private var availableUpdate: AppUpdater.Update?
@@ -2890,6 +2900,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
         let wasMenuOpen = menuWasOpen ?? isMenuOpen
+        let generation = refreshGeneration
         isRefreshing = true
         // Keep the last known quota visible during a refresh instead of flashing "...".
         if overview == nil {
@@ -2907,12 +2918,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             } catch ClientError.unauthorized {
                 authSession = nil
             }
-            if authSession?.authenticated == true {
+            guard generation == refreshGeneration else {
+                return
+            }
+            // A passwordless guest session also reports "authenticated", so the role has to match the
+            // saved one as well — otherwise a saved admin login is silently never restored.
+            let savedRole = settings.loginRole(for: settings.baseURLString)
+            let needsSavedLogin = authSession?.authenticated != true
+                || (savedRole == .admin && authSession?.role != "admin")
+            if !needsSavedLogin {
                 autoLoginAttemptedForURL = nil
             } else if autoLoginAttemptedForURL != settings.baseURLString {
                 await restoreSavedLogin()
             }
             let fetched = try await client.fetchOverview()
+            // The server was switched while this request was in flight: the data belongs to the old
+            // one, so it must not replace what the new one shows (or feed its notifications).
+            guard generation == refreshGeneration else {
+                return
+            }
             overview = fetched
             lastRefreshedAt = Date()
             latestError = nil
@@ -2979,6 +3003,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
         } catch {
             savedLoginError = error.localizedDescription
+            // A wrong password (401) stays latched so the stale password is not re-sent every
+            // refresh; a hiccup (offline, 5xx, rate limit) must not disable automatic login until
+            // the app restarts.
+            if case ClientError.unauthorized = error {
+                return
+            }
+            autoLoginAttemptedForURL = nil
         }
     }
 
@@ -3060,8 +3091,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     return AccountQuotaKey(status: account.status, remaining: remaining, label: label, accountId: account.accountId)
                 }
                 let meter = statusBarAccountMeter(keys, sort: settings.accountsSort)
+                // Both arrays must stay the same length: the labels feed the `.accountsLabeled`
+                // drawing loop index by index, and an empty list still draws one placeholder bar.
                 meterValues = meter.entries.isEmpty ? [nil] : meter.entries.map(\.value)
-                accountLabels = meter.entries.map(\.label)
+                accountLabels = meter.entries.isEmpty ? [nil] : meter.entries.map(\.label)
                 accountOverflow = meter.overflow
                 statusBarAccountIDs = meter.entries.compactMap(\.accountId)
                 statusBarCellWidths = AccountMeterMetrics.cellWidths(values: meterValues)
@@ -3080,6 +3113,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     meterValues.append(summary.primary ?? summary.secondary ?? summary.monthly)
                 }
             }
+        } else {
+            // The usage bar is hidden: drop the hit-testing state too, or a right click on the
+            // sparkline or the logo opens a stale per-account menu.
+            statusBarAccountIDs = []
+            statusBarCellWidths = []
+            statusBarMeterWidth = 0
         }
         var graphPoints: [Double]?
         if components.chart {
@@ -3192,7 +3231,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             let barWidth: CGFloat = 34
             let count = max(values.count, 1)
             let percentText = meterStyle == .combinedPercent
-                ? (values.first ?? nil).map { "\(Int(round($0)))%" } ?? ""
+                ? (values.first ?? nil).map(formatPercent) ?? ""
                 : ""
             let percentWidth = percentText.isEmpty
                 ? 0
@@ -3251,14 +3290,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                         let color = tones[index].flatMap { self?.menuBarColor($0) } ?? menuBarInk()
                         color.setFill()
                         NSBezierPath(roundedRect: fill, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
-                        let percent = "\(Int(round(value)))%" as NSString
+                        let percent = formatPercent(value) as NSString
                         let size = percent.size(withAttributes: [.font: percentFont])
                         // Whole-point origin: a half-point would soften the glyphs, which stands out
                         // next to the text the other menu-bar apps draw on the pixel grid.
                         percent.draw(at: NSPoint(x: track.maxX + percentGap, y: ((height - size.height) / 2).rounded()),
                                      withAttributes: [.font: percentFont, .foregroundColor: menuBarInk()])
                     }
-                    if showsLabel, let label = labels?[index], !label.isEmpty {
+                    if showsLabel, let labels, index < labels.count, let label = labels[index], !label.isEmpty {
                         let size = label.size(withAttributes: [.font: AccountMeterMetrics.labelFont])
                         let labelX = track.minX
                         let labelY = (height - size.height - 1).rounded()
@@ -3655,7 +3694,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 showError(snapshot == nil
                     ? "Reset credit details are not loaded on the server yet. Try again after the next refresh."
                     : "No reset credits are available for \(accountTitle(account)).")
-                await refresh()
+                await refreshWhenIdle(menuWasOpen: isMenuOpen)
                 return
             }
             let expiries = snapshot.credits
@@ -3754,6 +3793,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func startReauth(account: AccountSummary, method: String) {
         let accountId = account.accountId
         guard accountMutations[accountId] == nil else {
+            return
+        }
+        // The server keeps one pending device flow: starting a second one silently drops the first,
+        // which would leave that account stuck on "Signing in..." until its flow expires.
+        if method == "device",
+           let pending = reauthFlows.values.first(where: { $0.method == "device" && $0.accountId != accountId }) {
+            showError("A device sign-in for \(pending.accountName) is already in progress. Finish it, or cancel it from that account's status badge, before starting another.")
             return
         }
         accountMutations[accountId] = .reauth
@@ -4032,8 +4078,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         overview = nil
         client = CodexLBClient(settings: settings)
         autoLoginAttemptedForURL = nil
+        refreshGeneration += 1
         Task {
-            await refresh()
+            await refreshWhenIdle(menuWasOpen: isMenuOpen)
         }
     }
 
@@ -4063,7 +4110,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 }
                 let status = DashboardPasswordStore.save(password, role: .admin, for: baseURL)
                 settings.setLoginRole(.admin, for: baseURL)
-                await refresh()
+                await refreshWhenIdle(menuWasOpen: isMenuOpen)
                 if status != errSecSuccess {
                     showError("Admin login succeeded, but the password could not be saved in Keychain (error \(status)).")
                 }
@@ -4090,7 +4137,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     ? DashboardPasswordStore.delete(.guest, for: baseURL)
                     : DashboardPasswordStore.save(password, role: .guest, for: baseURL)
                 settings.setLoginRole(.guest, for: baseURL)
-                await refresh()
+                await refreshWhenIdle(menuWasOpen: isMenuOpen)
                 if status != errSecSuccess {
                     showError("Guest login succeeded, but its Keychain entry could not be updated (error \(status)).")
                 }
@@ -4115,7 +4162,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             }
             autoLoginAttemptedForURL = settings.baseURLString
             authSession = nil
-            await refresh()
+            await refreshWhenIdle(menuWasOpen: isMenuOpen)
         }
     }
 
@@ -4197,7 +4244,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// isn't on one of the account bars (graph, other meter styles, gaps, the `+N` marker).
     private func statusBarAccountIndex(at point: NSPoint, in button: NSButton) -> Int? {
         let style = settings.meterStyle
-        guard (style == .accounts || style == .accountsLabeled),
+        guard settings.statusBarComponents.usage,
+              style == .accounts || style == .accountsLabeled,
               !statusBarAccountIDs.isEmpty,
               let cell = button.cell else {
             return nil
@@ -4462,8 +4510,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let progress = UpdateProgressWindow(title: "Updating Codex LB Status")
         progress.show()
         do {
-            try await updater.install(update) { message in
-                progress.update(message)
+            try await updater.install(update) { step in
+                progress.update(step.message, fraction: step.fraction, detail: step.detail)
             }
         } catch {
             progress.close()
@@ -4663,7 +4711,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 }
 
 private func formatPercent(_ value: Double) -> String {
-    "\(Int(round(value)))%"
+    "\(percentInt(value))%"
 }
 
 private func formatOptionalPercent(_ value: Double?) -> String {

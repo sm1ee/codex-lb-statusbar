@@ -45,6 +45,7 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 
 **Accounts**
 - Status, routing policy, quota, reset timing, and pace per window (`On pace`, `N% in reserve`, `Runs out in …`), with an even-pace tick on each bar. The estimate drops to its own line when it cannot share the row with the reset countdown.
+- The card footer carries the per-account reset credits (count and soonest expiry) and the purchased credit balance the server reports — `65,000 credits`, `1,250.75 credits`, or `Unlimited`, the same rule the codex-lb dashboard uses — beside the warm-up state.
 - Sort by status, remaining quota, soonest reset, or name, or show only accounts that need attention.
 - Admin controls: pause/resume, cycle routing policy, and use a reset credit (with a confirmation showing which credit is used).
 - Re-authenticate expired accounts from the status badge via browser OAuth (paste the callback URL for remote servers) or device code.

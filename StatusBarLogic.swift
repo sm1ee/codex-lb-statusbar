@@ -772,6 +772,31 @@ func formatCompactCount(_ value: Double) -> String {
     return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + units[unit].suffix
 }
 
+/// Purchased credit balance for the account footer, following the dashboard's rule
+/// (`formatPurchasedCredits`): an unlimited account reads "Unlimited credits", otherwise the balance
+/// with up to two decimals ("65,000 credits", "65,000.50 credits"). A zero balance is only worth a
+/// line when the server says the account actually has the credits feature, so everything else is nil.
+func creditsBalanceText(has: Bool?, unlimited: Bool?, balance: Double?) -> String? {
+    if unlimited == true {
+        return "Unlimited"
+    }
+    guard let balance, balance.isFinite, balance >= 0 else {
+        return nil
+    }
+    if balance == 0, has != true {
+        return nil
+    }
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.locale = Locale(identifier: "en_US")
+    formatter.minimumFractionDigits = 0
+    formatter.maximumFractionDigits = balance == balance.rounded() ? 0 : 2
+    guard let text = formatter.string(from: NSNumber(value: balance)) else {
+        return nil
+    }
+    return "\(text) credits"
+}
+
 func formatUSD(_ value: Double) -> String {
     if value >= 10_000 {
         return "$" + formatCompactCount(value)

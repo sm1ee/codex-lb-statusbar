@@ -393,5 +393,15 @@ private enum StatusBarLogicTests {
         assert(segments.map(\.text) == ["5h 70%", "W 30%", "(1/2)"])
         assert(segments[0].kind == .quota(.green))
         assert(segments[1].kind == .quota(.amber))
+
+        // Purchased credits: same rule the dashboard uses, minus the noise for accounts without any.
+        assert(creditsBalanceText(has: true, unlimited: false, balance: 65_000) == "65,000 credits")
+        assert(creditsBalanceText(has: false, unlimited: false, balance: 65_000) == "65,000 credits")
+        assert(creditsBalanceText(has: nil, unlimited: nil, balance: 65_000.5) == "65,000.5 credits")
+        assert(creditsBalanceText(has: true, unlimited: false, balance: 0) == "0 credits")
+        assert(creditsBalanceText(has: false, unlimited: false, balance: 0) == nil)
+        assert(creditsBalanceText(has: nil, unlimited: nil, balance: nil) == nil)
+        assert(creditsBalanceText(has: nil, unlimited: true, balance: nil) == "Unlimited")
+        assert(creditsBalanceText(has: nil, unlimited: nil, balance: .infinity) == nil)
     }
 }

@@ -370,6 +370,11 @@ private struct AccountSummary: Decodable {
     let limitWarmup: AccountLimitWarmupStatus?
     let availableResetCredits: Int?
     let resetCreditNearestExpiresAt: Date?
+    /// Purchased credit balance the server reports alongside the quota windows (`creditsBalance`),
+    /// with `creditsUnlimited` marking accounts that have no cap to count down.
+    let creditsHas: Bool?
+    let creditsUnlimited: Bool?
+    let creditsBalance: Double?
 }
 
 private struct AccountUsage: Decodable {
@@ -1471,7 +1476,20 @@ private final class AccountCardView: NSView {
         let warmup = makeLabel(warmupText, size: 11, weight: .regular, color: VisualStyle.textMuted)
         warmup.alignment = .right
         warmup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let bottomRow = NSStackView(views: [creditView, NSView.spacer(), warmup])
+        // Purchased credits sit between the reset credits and the warm-up state; the flex on either
+        // side keeps the number in the middle of the footer.
+        var footerViews: [NSView] = [creditView, NSView.spacer()]
+        if let creditsText = creditsBalanceText(has: account.creditsHas,
+                                               unlimited: account.creditsUnlimited,
+                                               balance: account.creditsBalance) {
+            let creditsLabel = makeLabel(creditsText, size: 11, color: VisualStyle.textMuted)
+            creditsLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            creditsLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+            footerViews.append(creditsLabel)
+            footerViews.append(NSView.spacer())
+        }
+        footerViews.append(warmup)
+        let bottomRow = NSStackView(views: footerViews)
         bottomRow.orientation = .horizontal
         bottomRow.alignment = .centerY
         bottomRow.spacing = 8

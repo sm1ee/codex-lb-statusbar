@@ -288,6 +288,13 @@ func canRedeemResetCredit(status: String, availableCount: Int) -> Bool {
     availableCount > 0 && !nonRedeemableStatuses.contains(status)
 }
 
+/// Reset-credit count to display: the live probe when it has run, otherwise the overview's value.
+/// The overview's number comes from a per-replica snapshot, so it reads 0 for accounts whose credits
+/// exist but have not been cached by the replica that served the request.
+func resolvedResetCreditCount(overview: Int?, probed: Int?) -> Int {
+    max(0, probed ?? overview ?? 0)
+}
+
 func compactRemaining(until date: Date, now: Date = Date()) -> String {
     let seconds = Int(date.timeIntervalSince(now))
     if seconds <= 0 {

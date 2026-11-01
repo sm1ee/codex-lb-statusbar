@@ -412,6 +412,17 @@ private struct ResetCreditsSnapshot: Decodable {
     let credits: [ResetCreditItem]
 }
 
+/// Live reset-credit count for one account (`/api/accounts/{id}/usage-reset-credits`). The server
+/// answers this from a fresh upstream read of the account's usage, unlike the replica-local snapshot
+/// the overview carries — which is how the dashboard shows a count the overview reports as zero.
+private struct UsageResetCreditsResponse: Decodable {
+    struct Credits: Decodable {
+        let availableCount: Int
+    }
+
+    let rateLimitResetCredits: Credits
+}
+
 private struct ResetCreditConsumeResponse: Decodable {
     let code: String?
     let windowsReset: Int?
@@ -540,6 +551,15 @@ private final class CodexLBClient {
     /// Returns `nil` when the server has no cached reset-credit snapshot for the account yet.
     func getResetCredits(_ accountId: String) async throws -> ResetCreditsSnapshot? {
         try await request(path: "/api/accounts/\(encodedPathComponent(accountId))/rate-limit-reset-credits")
+    }
+
+    /// Live reset-credit count for an account. Used when the overview reports none: its value comes
+    /// from a per-replica in-memory snapshot that can be empty while credits exist.
+    func getUsageResetCredits(_ accountId: String) async throws -> Int {
+        let response: UsageResetCreditsResponse = try await request(
+            path: "/api/accounts/\(encodedPathComponent(accountId))/usage-reset-credits"
+        )
+        return max(0, response.rateLimitResetCredits.availableCount)
     }
 
     /// `redeemRequestId` makes the consume idempotent: retrying with the same id reuses the server-side pin.
@@ -1294,6 +1314,8 @@ private final class AccountCardView: NSView {
         statusAction: Selector,
         routingAction: Selector,
         resetAction: Selector,
+        /// Live reset-credit count probed from the server when the overview reported none.
+        resetCreditCountOverride: Int? = nil,
         contextMenuProvider: @escaping (String) -> NSMenu?
     ) {
         let windows = quotaWindows(for: account)
@@ -1424,10 +1446,16 @@ private final class AccountCardView: NSView {
         topRow.translatesAutoresizingMaskIntoConstraints = false
         addSubview(topRow)
 
-        let resetCount = account.availableResetCredits ?? 0
+        // The overview's count comes from a per-replica snapshot that can be stale or empty; the panel
+        // hands over the live count when it has probed one. The cached expiry only pairs with the
+        // count it was reported for.
+        let resetCount = resolvedResetCreditCount(overview: account.availableResetCredits, probed: resetCreditCountOverride)
+        let resetExpiry = resetCreditCountOverride == nil || resetCreditCountOverride == account.availableResetCredits
+            ? account.resetCreditNearestExpiresAt
+            : nil
         let resetCreditLabel = resetCreditSummaryText(
             count: resetCount,
-            expiresAt: account.resetCreditNearestExpiresAt
+            expiresAt: resetExpiry
         ).map { label -> ResetCreditButton in
             let redeemable = canRedeemResetCredit(status: account.status, availableCount: resetCount)
             let button = ResetCreditButton(
@@ -1547,6 +1575,8 @@ private final class AccountsPanelView: RoundedPanelView {
         sortAction: Selector,
         filterAction: Selector,
         offlineSince: Date?,
+        /// Live reset-credit counts for accounts whose overview summary reported none.
+        liveResetCredits: [String: Int] = [:],
         contextMenuProvider: @escaping (String) -> NSMenu?
     ) {
         let isOffline = offlineSince != nil
@@ -1564,6 +1594,7 @@ private final class AccountsPanelView: RoundedPanelView {
                 statusAction: statusAction,
                 routingAction: routingAction,
                 resetAction: resetAction,
+                resetCreditCountOverride: liveResetCredits[account.accountId],
                 contextMenuProvider: contextMenuProvider
             )
         }
@@ -2803,6 +2834,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     /// Bumped whenever the client is replaced (server URL change): a refresh that started against the
     /// old server must not write its results into state that now belongs to the new one.
     private var refreshGeneration = 0
+    /// Live reset-credit counts for accounts whose overview summary reported none: that summary comes
+    /// from a replica-local snapshot that can be empty while credits exist (codex-lb#2693).
+    private var liveResetCredits: [String: Int] = [:]
+    private var resetCreditProbeDates: [String: Date] = [:]
+    private var isProbingResetCredits = false
     private let updater = AppUpdater()
     private var appearanceObservation: NSKeyValueObservation?
     private var availableUpdate: AppUpdater.Update?
@@ -2961,6 +2997,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             offlineSince = nil
             updateStatusTitle()
             notifier.process(fetched.accounts)
+            Task { await probeLiveResetCredits(accounts: fetched.accounts) }
             await checkServerVersionIfDue()
         } catch ClientError.unauthorized {
             overview = nil
@@ -3497,6 +3534,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     sortAction: #selector(cycleAccountSort),
                     filterAction: #selector(toggleAccountFilter),
                     offlineSince: offlineSince,
+                    liveResetCredits: liveResetCredits,
                     contextMenuProvider: { [weak self] accountId in
                         self?.showAccountMenu(accountId)
                         return nil
@@ -3685,6 +3723,45 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     // MARK: - Reset credits
 
+    /// The overview's reset-credit count comes from a replica-local in-memory snapshot: a replica that
+    /// has not refreshed (or whose fetch failed) reports zero for every account while the credits
+    /// exist, which is what the dashboard avoids by reading a live endpoint. For accounts the overview
+    /// reports as empty, ask that endpoint — at most once every five minutes per account.
+    private func probeLiveResetCredits(accounts: [AccountSummary]) async {
+        guard !isProbingResetCredits, authSession?.authenticated == true, offlineSince == nil else {
+            return
+        }
+        let now = Date()
+        let due = accounts.filter { account in
+            guard (account.availableResetCredits ?? 0) == 0 else {
+                return false
+            }
+            guard canRedeemResetCredit(status: account.status, availableCount: 1) else {
+                return false
+            }
+            return now.timeIntervalSince(resetCreditProbeDates[account.accountId] ?? .distantPast) >= 300
+        }
+        guard !due.isEmpty else {
+            return
+        }
+        isProbingResetCredits = true
+        defer { isProbingResetCredits = false }
+        var changed = false
+        for account in due {
+            guard let count = try? await client.getUsageResetCredits(account.accountId) else {
+                continue
+            }
+            resetCreditProbeDates[account.accountId] = now
+            if liveResetCredits[account.accountId] != count {
+                liveResetCredits[account.accountId] = count
+                changed = true
+            }
+        }
+        if changed, overview != nil {
+            rebuildMenu(updateVisiblePanel: isMenuOpen)
+        }
+    }
+
     @objc private func resetCreditTapped(_ sender: ResetCreditButton) {
         let accountId = sender.accountId
         guard authSession?.role == "admin", accountMutations[accountId] == nil else {
@@ -3706,6 +3783,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 snapshot = try await client.getResetCredits(accountId)
             } catch {
                 showError("Could not load reset credits: \(error.localizedDescription)")
+                return
+            }
+            if snapshot == nil, let liveCount = liveResetCredits[accountId], liveCount > 0 {
+                // The replica serving this client has no cached snapshot while the live endpoint says
+                // credits exist (codex-lb#2693). The expiry detail is unavailable, so confirm without
+                // it — the server resolves the soonest credit when it consumes one.
+                let message = resetCreditConfirmationText(
+                    accountName: accountTitle(account),
+                    availableCount: liveCount,
+                    soonestExpiresAt: nil,
+                    otherExpiries: [],
+                    formatDate: { DateFormatters.dateTime.string(from: $0) }
+                )
+                guard confirmDestructive(
+                    title: "Use a reset credit?",
+                    message: message,
+                    confirmTitle: "Use Reset Credit"
+                ) else {
+                    return
+                }
+                await redeemResetCredit(account: account, redeemRequestId: UUID().uuidString)
                 return
             }
             guard let snapshot, snapshot.availableCount > 0 else {
@@ -4097,6 +4195,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         client = CodexLBClient(settings: settings)
         autoLoginAttemptedForURL = nil
         refreshGeneration += 1
+        liveResetCredits.removeAll()
+        resetCreditProbeDates.removeAll()
         Task {
             await refreshWhenIdle(menuWasOpen: isMenuOpen)
         }

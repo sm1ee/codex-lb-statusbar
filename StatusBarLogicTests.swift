@@ -403,5 +403,12 @@ private enum StatusBarLogicTests {
         assert(creditsBalanceText(has: nil, unlimited: nil, balance: nil) == nil)
         assert(creditsBalanceText(has: nil, unlimited: true, balance: nil) == "Unlimited")
         assert(creditsBalanceText(has: nil, unlimited: nil, balance: .infinity) == nil)
+
+        // Reset credits: the live probe wins over the overview's replica-local snapshot.
+        assert(resolvedResetCreditCount(overview: nil, probed: nil) == 0)
+        assert(resolvedResetCreditCount(overview: 0, probed: 1) == 1)
+        assert(resolvedResetCreditCount(overview: 2, probed: nil) == 2)
+        assert(resolvedResetCreditCount(overview: 2, probed: 0) == 0)
+        assert(resolvedResetCreditCount(overview: -5, probed: nil) == 0)
     }
 }

@@ -2839,6 +2839,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var liveResetCredits: [String: Int] = [:]
     private var resetCreditProbeDates: [String: Date] = [:]
     private var isProbingResetCredits = false
+    /// Accounts where a consume came back "no available reset credit": the usage counter reported
+    /// credits the server could not redeem, so the probe stays off until the server's own summary
+    /// reports credits for the account again.
+    private var accountsWithoutConsumableCredits: Set<String> = []
     private let updater = AppUpdater()
     private var appearanceObservation: NSKeyValueObservation?
     private var availableUpdate: AppUpdater.Update?
@@ -2997,6 +3001,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             offlineSince = nil
             updateStatusTitle()
             notifier.process(fetched.accounts)
+            // The server's own summary reporting credits is the only evidence that a consume can
+            // succeed, so re-arm the probe for those accounts.
+            accountsWithoutConsumableCredits.subtract(
+                fetched.accounts.filter { ($0.availableResetCredits ?? 0) > 0 }.map(\.accountId)
+            )
             Task { await probeLiveResetCredits(accounts: fetched.accounts) }
             await checkServerVersionIfDue()
         } catch ClientError.unauthorized {
@@ -3119,21 +3128,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         var meterValues: [Double?] = []
         var accountLabels: [String?] = []
+        var meterWindows: [[Double?]] = []
         var accountOverflow = 0
         if components.usage {
             if meterStyle == .accounts || meterStyle == .accountsLabeled {
                 // One bar per counted account, worst first (see `statusBarAccountMeter`).
                 let keys = overview.accounts.map { account in
-                    let remaining: Double?
-                    if items.primary {
-                        remaining = account.usage?.primaryRemainingPercent
-                            ?? account.usage?.secondaryRemainingPercent
-                            ?? account.usage?.monthlyRemainingPercent
-                    } else if items.secondary {
-                        remaining = account.usage?.secondaryRemainingPercent
-                            ?? account.usage?.monthlyRemainingPercent
-                    } else {
-                        remaining = account.usage?.monthlyRemainingPercent
+                    // Windows the cell draws, 5h first. The tightest one drives the percent and the
+                    // color, so an account with a full 5h window but an exhausted weekly reads 0%.
+                    var windows: [Double?] = []
+                    if items.primary, let primary = account.usage?.primaryRemainingPercent {
+                        windows.append(primary)
+                    }
+                    if items.secondary, let secondary = account.usage?.secondaryRemainingPercent {
+                        windows.append(secondary)
+                    }
+                    if windows.isEmpty {
+                        // Nothing for the enabled windows: fall back to whatever the account reports
+                        // so the cell still says something (at most two halves to draw).
+                        windows = Array(
+                            [account.usage?.primaryRemainingPercent,
+                             account.usage?.secondaryRemainingPercent,
+                             account.usage?.monthlyRemainingPercent].compactMap { $0 }.prefix(2)
+                        )
                     }
                     // The label follows the account's display name: the alias when set, else the email
                     // prefix, cut to the width of the bar it sits above.
@@ -3143,13 +3160,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     } else {
                         label = accountMeterLabel(email: account.email, maxWidth: AccountMeterMetrics.barWidth, width: AccountMeterMetrics.labelWidth)
                     }
-                    return AccountQuotaKey(status: account.status, remaining: remaining, label: label, accountId: account.accountId)
+                    return AccountQuotaKey(status: account.status, windows: windows, label: label, accountId: account.accountId)
                 }
                 let meter = statusBarAccountMeter(keys, sort: settings.accountsSort)
-                // Both arrays must stay the same length: the labels feed the `.accountsLabeled`
-                // drawing loop index by index, and an empty list still draws one placeholder bar.
+                // The value, label and windows arrays must stay the same length: the drawing loop
+                // indexes all three, and an empty list still draws one placeholder bar.
                 meterValues = meter.entries.isEmpty ? [nil] : meter.entries.map(\.value)
                 accountLabels = meter.entries.isEmpty ? [nil] : meter.entries.map(\.label)
+                meterWindows = meter.entries.isEmpty ? [[]] : meter.entries.map(\.windows)
                 accountOverflow = meter.overflow
                 statusBarAccountIDs = meter.entries.compactMap(\.accountId)
                 statusBarCellWidths = AccountMeterMetrics.cellWidths(values: meterValues)
@@ -3184,7 +3202,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         let button = statusItem.button
         // The app logo marks the item when every component is off, keeping it visible/clickable.
-        let statusImage = statusBarImage(meterValues: meterValues, meterStyle: meterStyle, graphPoints: graphPoints, chartStyle: settings.usageChartStyle, colorMode: colorMode, overflowCount: accountOverflow, labels: accountLabels)
+        let statusImage = statusBarImage(meterValues: meterValues, meterStyle: meterStyle, graphPoints: graphPoints, chartStyle: settings.usageChartStyle, colorMode: colorMode, overflowCount: accountOverflow, labels: accountLabels, windows: meterWindows)
             ?? (components.usage || components.chart ? nil : statusBarLogoImage())
         if let image = statusImage {
             button?.image = image
@@ -3211,15 +3229,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             var perAccount = overview.accounts
                 .filter { isCountedForQuota(status: $0.status) }
                 .compactMap { account -> (Double, String)? in
-                    guard let remaining = account.usage?.primaryRemainingPercent
-                        ?? account.usage?.secondaryRemainingPercent
-                        ?? account.usage?.monthlyRemainingPercent else {
+                    // Both windows read better than the tightest alone when the account has two — the
+                    // same reason the meter cell splits its bar.
+                    let declared: [(String, Double?)] = [("5h", account.usage?.primaryRemainingPercent),
+                                                         ("W", account.usage?.secondaryRemainingPercent),
+                                                         ("M", account.usage?.monthlyRemainingPercent)]
+                    let present = declared.compactMap { pair in pair.1.map { (pair.0, $0) } }
+                    guard let tightest = present.map(\.1).min() else {
                         return nil
                     }
+                    let detail = present.count > 1
+                        ? present.map { "\($0.0) \(formatPercent($0.1))" }.joined(separator: " ")
+                        : formatPercent(tightest)
                     // The tooltip has room for the whole name, unlike the bar label.
                     let label = account.alias.flatMap { $0.isEmpty ? nil : $0 } ?? accountEmailPrefix(account.email)
-                    let text = label.map { "\($0) \(formatPercent(remaining))" } ?? formatPercent(remaining)
-                    return (remaining, text)
+                    let text = label.map { "\($0) \(detail)" } ?? detail
+                    return (tightest, text)
                 }
             switch settings.accountsSort {
             case .usage:
@@ -3272,7 +3297,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     /// Meter image for the chosen shape. Monochrome renders as a template image so macOS tints it.
-    private func quotaMeterImage(_ values: [Double?], meterStyle: MeterStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil) -> NSImage {
+    private func quotaMeterImage(_ values: [Double?], meterStyle: MeterStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil, windows: [[Double?]]? = nil) -> NSImage {
         let tones = values.map { $0.map { statusMeterTone(quotaTone(for: $0), mode: colorMode) } ?? nil }
         let isTemplate = tones.allSatisfy { $0 == nil }
         let image: NSImage
@@ -3334,29 +3359,53 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 let barY: CGFloat = showsLabel ? 2 : (height - barHeight) / 2
                 let percentFont = AccountMeterMetrics.percentFont
                 var x: CGFloat = 0
-                for (index, value) in values.enumerated() {
-                    let track = NSRect(x: x, y: barY, width: barWidth, height: barHeight)
+                // The color is resolved at the call site: a nested function is nonisolated here, and
+                // `menuBarColor` is main-actor isolated.
+                func drawBar(in track: NSRect, value: Double?, color: NSColor) {
                     menuBarInk().withAlphaComponent(0.25).setFill()
-                    NSBezierPath(roundedRect: track, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+                    NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+                    guard let value else {
+                        return
+                    }
+                    let fraction = CGFloat(min(max(value, 0), 100) / 100)
+                    var fill = track
+                    fill.size.width = max(fraction > 0 ? track.height : 0, track.width * fraction)
+                    color.setFill()
+                    NSBezierPath(roundedRect: fill, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+                }
+                for (index, value) in values.enumerated() {
+                    // A cell with two windows (5h and Weekly) splits its bar in half so both read at
+                    // once; the percent beside it is the tightest of the two.
+                    let cellWindows = windows.flatMap { index < $0.count ? $0[index] : nil }?.compactMap { $0 } ?? []
+                    if cellWindows.count > 1 {
+                        let half = ((barWidth - 2) / 2).rounded(.down)
+                        for (slot, windowValue) in cellWindows.prefix(2).enumerated() {
+                            let tone = statusMeterTone(quotaTone(for: windowValue), mode: colorMode)
+                            drawBar(
+                                in: NSRect(x: x + CGFloat(slot) * (half + 2), y: barY, width: half, height: barHeight),
+                                value: windowValue,
+                                color: tone.flatMap { self?.menuBarColor($0) } ?? menuBarInk()
+                            )
+                        }
+                    } else {
+                        drawBar(
+                            in: NSRect(x: x, y: barY, width: barWidth, height: barHeight),
+                            value: value,
+                            color: tones[index].flatMap { self?.menuBarColor($0) } ?? menuBarInk()
+                        )
+                    }
                     if let value {
-                        let fraction = CGFloat(min(max(value, 0), 100) / 100)
-                        var fill = track
-                        fill.size.width = max(fraction > 0 ? barHeight : 0, track.width * fraction)
-                        let color = tones[index].flatMap { self?.menuBarColor($0) } ?? menuBarInk()
-                        color.setFill()
-                        NSBezierPath(roundedRect: fill, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
                         let percent = formatPercent(value) as NSString
                         let size = percent.size(withAttributes: [.font: percentFont])
                         // Whole-point origin: a half-point would soften the glyphs, which stands out
                         // next to the text the other menu-bar apps draw on the pixel grid.
-                        percent.draw(at: NSPoint(x: track.maxX + percentGap, y: ((height - size.height) / 2).rounded()),
+                        percent.draw(at: NSPoint(x: x + barWidth + percentGap, y: ((height - size.height) / 2).rounded()),
                                      withAttributes: [.font: percentFont, .foregroundColor: menuBarInk()])
                     }
                     if showsLabel, let labels, index < labels.count, let label = labels[index], !label.isEmpty {
                         let size = label.size(withAttributes: [.font: AccountMeterMetrics.labelFont])
-                        let labelX = track.minX
                         let labelY = (height - size.height - 1).rounded()
-                        label.draw(at: NSPoint(x: labelX, y: labelY), withAttributes: [.font: AccountMeterMetrics.labelFont, .foregroundColor: menuBarInk()])
+                        label.draw(at: NSPoint(x: x, y: labelY), withAttributes: [.font: AccountMeterMetrics.labelFont, .foregroundColor: menuBarInk()])
                     }
                     x += cellWidths[index] + gap
                 }
@@ -3470,10 +3519,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     /// Combines the meter and graph into one status-bar image, or nil when neither is shown.
-    private func statusBarImage(meterValues: [Double?], meterStyle: MeterStyle, graphPoints: [Double]?, chartStyle: UsageChartStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil) -> NSImage? {
+    private func statusBarImage(meterValues: [Double?], meterStyle: MeterStyle, graphPoints: [Double]?, chartStyle: UsageChartStyle, colorMode: StatusBarColorMode, overflowCount: Int = 0, labels: [String?]? = nil, windows: [[Double?]]? = nil) -> NSImage? {
         var images: [NSImage] = []
         if !meterValues.isEmpty {
-            images.append(quotaMeterImage(meterValues, meterStyle: meterStyle, colorMode: colorMode, overflowCount: overflowCount, labels: labels))
+            images.append(quotaMeterImage(meterValues, meterStyle: meterStyle, colorMode: colorMode, overflowCount: overflowCount, labels: labels, windows: windows))
         }
         if let graphPoints, graphPoints.count >= 2 {
             images.append(usageGraphImage(graphPoints, chartStyle: chartStyle))
@@ -3736,6 +3785,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard (account.availableResetCredits ?? 0) == 0 else {
                 return false
             }
+            guard !accountsWithoutConsumableCredits.contains(account.accountId) else {
+                return false
+            }
             guard canRedeemResetCredit(status: account.status, availableCount: 1) else {
                 return false
             }
@@ -3852,6 +3904,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         } catch {
             accountMutations.removeValue(forKey: accountId)
             rebuildMenu(updateVisiblePanel: isMenuOpen)
+            if case ClientError.server(let statusCode, _) = error, statusCode == 409 {
+                // The server refuses because the replica that answered has no redeemable snapshot for
+                // the account (codex-lb#2693) — the count the app probed comes from the usage payload,
+                // which can disagree. Drop it, remember not to show it again until the server's own
+                // summary reports credits, and explain instead of offering a retry that cannot help.
+                liveResetCredits.removeValue(forKey: accountId)
+                resetCreditProbeDates.removeValue(forKey: accountId)
+                accountsWithoutConsumableCredits.insert(accountId)
+                showInfo(
+                    title: "No usable reset credit",
+                    message: "The server has no reset credit it can redeem for \(accountTitle(account)) right now, so nothing was used. Its usage counter can disagree with the credits the server can actually consume."
+                )
+                await refreshWhenIdle(menuWasOpen: isMenuOpen)
+                return
+            }
             // Retrying with the same redeemRequestId is idempotent on the server, so a lost
             // response cannot burn a second credit.
             if confirmRetry(title: "Reset credit failed", message: error.localizedDescription) {
@@ -4197,6 +4264,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshGeneration += 1
         liveResetCredits.removeAll()
         resetCreditProbeDates.removeAll()
+        accountsWithoutConsumableCredits.removeAll()
         Task {
             await refreshWhenIdle(menuWasOpen: isMenuOpen)
         }

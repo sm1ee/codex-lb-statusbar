@@ -37,7 +37,7 @@ Requires macOS 13 or later and a running Codex LB server. After installing, the 
 
 **Menu bar**
 - Average remaining quota (5h / weekly) as a usage bar and a token-usage sparkline (same data and style as the menu chart) — each an independent toggle; the app logo appears when both are off.
-- Usage bar shapes: one rounded bar per window (5h, Weekly) stacked, the same with the first window's percent beside it, or one bar per account in a single row with the percent beside it — plain or with the email prefix above each bar (up to 10 accounts, then a `+N` overflow marker).
+- Usage bar shapes: one rounded bar per window (5h, Weekly) stacked, the same with the first window's percent beside it, or one bar per account in a single row with the percent beside it — plain or with the email prefix above each bar (up to 10 accounts, then a `+N` overflow marker). An account with both windows splits its bar in half — 5h on the left, Weekly on the right — and the percent beside it is the tightest of the two, so a full 5h window next to an exhausted weekly reads 0%.
 - Accounts can be ordered by usage (worst or best first), by name, or in server order.
 - The average counts rate-limited and quota-exceeded accounts (usually 0%) and leaves out paused, re-auth-required, and deactivated ones, so it doesn't jump when an account runs dry.
 - Colors: `Warnings Only` (default), `Full Color`, `Usage Only` (usage bar colored, text plain), or `Monochrome`. Each item can be hidden.

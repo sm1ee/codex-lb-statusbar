@@ -249,6 +249,21 @@ private enum StatusBarLogicTests {
         assert(capped.overflow == 10)
         assert(statusBarAccountMeter([]).entries.isEmpty)
         assert(statusBarAccountMeter([AccountQuotaKey(status: "paused", remaining: 50)]).entries.isEmpty)
+
+        // Two windows (5h + Weekly): the tightest drives the percent and the sort, both are kept so
+        // the cell can split its bar — a full 5h window with an exhausted weekly reads 0%, not 100%.
+        let media = AccountQuotaKey(status: "quota_exceeded", windows: [100, 0], label: "media", accountId: "acc-media")
+        assert(media.remaining == 0)
+        assert(AccountQuotaKey(status: "active", windows: [nil, 55]).remaining == 55)
+        assert(AccountQuotaKey(status: "active", windows: []).remaining == nil)
+        let mixed = statusBarAccountMeter(
+            [media, AccountQuotaKey(status: "active", remaining: 40, label: "bob", accountId: "acc-bob")],
+            sort: .usage
+        )
+        assert(mixed.entries.map(\.label) == ["media", "bob"])
+        assert(mixed.entries.first?.value == 0)
+        assert(mixed.entries.first?.windows == [100, 0])
+        assert(mixed.entries.last?.windows == [40])
         // Labels keep as much of the name as fits the bar width, marker included (6pt per character
         // here, 42pt bars).
         let measure: (String) -> CGFloat = { CGFloat($0.count) * 6 }

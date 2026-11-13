@@ -509,23 +509,44 @@ enum MeterStyle: String, CaseIterable {
 /// Minimal account facts for the status-bar accounts meter, decoupled from the Decodable model.
 struct AccountQuotaKey {
     let status: String
-    let remaining: Double?
     let label: String?
     let accountId: String?
+    /// Remaining percent per window in draw order (5h first). `remaining` is the tightest of them:
+    /// that is what decides whether the account can serve right now, so it drives the percent, the
+    /// color and the sort — an account with a full 5h window but an exhausted weekly reads as 0%.
+    let windows: [Double?]
 
-    init(status: String, remaining: Double?, label: String? = nil, accountId: String? = nil) {
+    var remaining: Double? {
+        windows.compactMap { $0 }.min()
+    }
+
+    init(status: String, windows: [Double?], label: String? = nil, accountId: String? = nil) {
         self.status = status
-        self.remaining = remaining
+        self.windows = windows
         self.label = label
         self.accountId = accountId
     }
+
+    /// Convenience for callers that only have a single value.
+    init(status: String, remaining: Double?, label: String? = nil, accountId: String? = nil) {
+        self.init(status: status, windows: [remaining], label: label, accountId: accountId)
+    }
 }
 
-/// One bar's value and optional label for the accounts meter.
+/// One cell of the accounts meter: the tightest window (percent, color and sort), the windows the
+/// cell draws (more than one is drawn side by side) and the optional label.
 struct AccountMeterEntry: Equatable {
     let value: Double?
+    let windows: [Double?]
     let label: String?
     let accountId: String?
+
+    init(value: Double?, windows: [Double?] = [], label: String? = nil, accountId: String? = nil) {
+        self.value = value
+        self.windows = windows.isEmpty ? [value] : windows
+        self.label = label
+        self.accountId = accountId
+    }
 }
 
 /// Accounts meter label: as much of the display string as fits `maxWidth`, measured by `width`,
@@ -593,7 +614,11 @@ enum AccountMeterSort: String, CaseIterable {
 func statusBarAccountMeter(_ accounts: [AccountQuotaKey], maxBars: Int = 10, sort: AccountMeterSort = .usage) -> (entries: [AccountMeterEntry], overflow: Int) {
     var counted = accounts
         .filter { isCountedForQuota(status: $0.status) }
-        .compactMap { key in key.remaining.map { AccountMeterEntry(value: $0, label: key.label, accountId: key.accountId) } }
+        .compactMap { key in
+            key.remaining.map {
+                AccountMeterEntry(value: $0, windows: key.windows, label: key.label, accountId: key.accountId)
+            }
+        }
     switch sort {
     case .usage:
         counted.sort { ($0.value ?? 0) < ($1.value ?? 0) }
